@@ -51,7 +51,7 @@ Alternatives Considered
 
 I first thought about storing everything in one table, but that would repeat the same webhook URL many times and make retry tracking messy.
 
-I also considered keeping status only inside delivery_attempts, but then the system would need extra queries and joins just to find pending events.
+I also considered keeping status only inside delivery_attempts, but then the system would need extra queries and joins just to find pending, delivered or failed events.
 
 Trade-offs Accepted
 
