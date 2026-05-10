@@ -87,3 +87,42 @@ Example failure scenario:
 From Redis's perspective, the message was never acknowledged, so it remains pending and can later be retried by another worker. This prevents message loss, but it also means the destination may receive duplicate webhook deliveries.
 
 The accepted side effect of at-least-once delivery is duplicate event delivery.
+
+
+# Failure Modes — Phase 1
+
+## Redis is unavailable
+**What happens:** The API can save the event in PostgreSQL but fails to write the delivery job into the Redis Stream.
+
+**Current behavior:** The event remains stored in PostgreSQL with `pending` status, but no worker receives the job because it never entered the stream.
+
+**Impact:** Webhook delivery never happens automatically. The event becomes orphaned until manually re-queued.
+
+---
+
+## Worker crashes before acknowledging message
+**What happens:** A worker successfully delivers the webhook but crashes before sending `XACK` to Redis.
+
+**Current behavior:** Redis keeps the message in the Pending Entries List (PEL). Another worker may later reclaim and process the message again.
+
+**Impact:** The destination may receive duplicate webhook deliveries. This is the accepted trade-off of at-least-once delivery.
+
+---
+
+## Redis Stream message lost
+**What happens:** Redis fails after the event is stored in PostgreSQL but before the stream message becomes durable.
+
+**Current behavior:** The delivery job may disappear from Redis while the event still exists in PostgreSQL.
+
+**Impact:** Delivery does not happen automatically. Since PostgreSQL is the source of truth, the queue can later be rebuilt from pending events.
+
+---
+
+## Slow destination server
+**What happens:** Destination webhook server responds slowly.
+
+**Current behavior:** Worker waits asynchronously for the HTTP response while the API remains responsive.
+
+**Impact:** Slow deliveries no longer block API requests, but workers may become occupied for longer periods.
+
+```
