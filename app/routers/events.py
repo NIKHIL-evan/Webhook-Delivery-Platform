@@ -39,7 +39,7 @@ async def register_event(body: EventCreate, db: AsyncSession = Depends(get_db)):
             event_status = event.status
             event_created_at = event.created_at
             
-            await redis_client.xadd("webhook_events", {"event_id": event_id, "endpoint_id": url_id})
+            await redis_client.xadd("webhook_events", {"event_id": str(event_id), "endpoint_id": str(url_id)})
 
         return {
         "event_id": str(event_id),
