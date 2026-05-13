@@ -2,19 +2,13 @@
 # Registers all routers and starts the server.
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
-from app.models import Base
-from app.database import engine
 from app.routers import endpoints, events, attempts
 from app.redis_client import redis_client
 import asyncio
-from worker import worker_loop
+from worker import worker_loop, retry_loop
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        print("Database Created")
-
     # create redis stream and worker group 
     try:
         await redis_client.xgroup_create(
@@ -28,6 +22,7 @@ async def lifespan(app: FastAPI):
             raise
     
     asyncio.create_task(worker_loop())
+    asyncio.create_task(retry_loop())
 
     yield
 
