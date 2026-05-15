@@ -1,12 +1,12 @@
 # Webhook Delivery Platform
 
-A self-hostable webhook delivery service built with FastAPI, PostgreSQL, Redis Streams, and asynchronous worker-based processing. Clients can register destination webhook URLs, submit JSON events, and the system delivers them asynchronously as HTTP POST requests. Delivery attempts and event states are persisted for observability and failure tracking.
+A self-hostable webhook delivery platform built with FastAPI, PostgreSQL, Redis Streams, and asynchronous worker-based processing. Clients can register destination webhook URLs, submit JSON events, and the system reliably delivers them as HTTP POST requests. The platform includes asynchronous processing, retry scheduling, dead letter handling, delivery attempt tracking, and idempotency protection.
 
 ---
 
-## Status
+# Status
 
-Phase 1 — asynchronous webhook delivery implemented using Redis Streams and worker-based processing.
+Phase 2 — reliability and retry semantics implemented.
 
 Implemented:
 - REST API with FastAPI
@@ -16,58 +16,80 @@ Implemented:
 - Background worker loop using asyncio
 - Asynchronous webhook delivery
 - Delivery attempt tracking
+- Retry scheduling with exponential backoff
+- Dead letter state handling
+- Idempotency key support
+- Failure tracking and retry persistence
 - Public deployment on Render
 - Basic load testing and performance measurement
 
 ---
 
-## Architecture
+# Architecture
 
 ```text
 Client
    ↓
 FastAPI API Server
    ↓
-PostgreSQL (source of truth)
+PostgreSQL (durable source of truth)
    ↓
-Redis Stream (delivery queue)
+Redis Stream (async delivery queue)
    ↓
 Worker Loop
    ↓
 Destination Webhook
 ```
 
+Retry flow:
+
+```text
+delivery fails
+    ↓
+event marked failed
+    ↓
+next_retry_at scheduled
+    ↓
+retry scheduler re-enqueues event
+    ↓
+worker retries delivery
+    ↓
+max retries exceeded
+    ↓
+event marked dead
+```
+
 ---
 
-## Local Setup
+# Local Setup
 
-### 1. Clone the repository
+## 1. Clone the repository
 
 ```bash
 git clone <repo-url>
 cd webhook-delivery-platform
 ```
 
-### 2. Create virtual environment
+## 2. Create virtual environment
 
 ```bash
 python -m venv venv
 source venv/bin/activate
 ```
 
-### 3. Install dependencies
+## 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Create PostgreSQL database
+## 4. Create PostgreSQL database
 
 ```bash
 sudo -u postgres createdb webhook_delivery
 ```
 
-### 5. Configure environment variables
+## 5. Configure environment variables
 
 Create a `.env` file:
 
@@ -76,14 +98,20 @@ DATABASE_URL=postgresql+asyncpg://postgres:<password>@localhost:5432/webhook_del
 REDIS_URL=redis://localhost:6379
 ```
 
-### 6. Run Redis locally
+## 6. Run Redis locally
 
 ```bash
 sudo apt install redis-server
 sudo systemctl start redis-server
 ```
 
-### 7. Run the application
+## 7. Run migrations
+
+```bash
+alembic upgrade head
+```
+
+## 8. Start the application
 
 ```bash
 uvicorn app.main:app --reload
@@ -91,13 +119,13 @@ uvicorn app.main:app --reload
 
 ---
 
-## API Endpoints
+# API Endpoints
 
-### POST `/endpoints`
+## POST /endpoints
 
 Registers a destination webhook URL.
 
-#### Request
+Request:
 
 ```json
 {
@@ -107,89 +135,164 @@ Registers a destination webhook URL.
 
 ---
 
-### POST `/events`
+## POST /events
 
-Creates an event, stores it in PostgreSQL, and writes a delivery job to the Redis Stream.
+Creates an event and asynchronously schedules webhook delivery.
 
-#### Request
+Request:
 
 ```json
 {
   "url_id": "<endpoint-uuid>",
   "payload": {
     "message": "hello world"
-  }
+  },
+  "idempotency_key": "optional-client-key"
 }
 ```
 
-#### Behavior
-
+Behavior:
 - validates endpoint exists
+- checks idempotency key if provided
 - stores event in PostgreSQL
-- writes job into Redis Stream
+- writes delivery job into Redis Stream
 - worker asynchronously delivers webhook
-- delivery attempts are stored in PostgreSQL
+- failed deliveries are retried with backoff
+- delivery attempts are persisted
 
 ---
 
-### GET `/events/{event_id}/delivery_attempts`
+## GET /events/{event_id}/delivery_attempts
 
-Fetches delivery attempts associated with an event.
+Fetches all delivery attempts associated with an event.
 
 ---
 
-## Performance (Phase 1)
+# Reliability Features (Phase 2)
 
-Load test: 200 requests, 10 concurrent, warm Render instance.
+## Retry Scheduling
+
+Failed deliveries are retried using exponential backoff.
+
+Current retry flow:
+- attempt 1 → retry after 2 seconds
+- attempt 2 → retry after 4 seconds
+- attempt 3 → retry after 8 seconds
+- etc.
+
+---
+
+## Dead Letter Handling
+
+Events stop retrying after reaching maximum retry attempts.
+
+Dead events remain persisted in PostgreSQL for inspection and debugging.
+
+---
+
+## Idempotency
+
+Clients may optionally send an `idempotency_key`.
+
+If the same key is submitted multiple times:
+- only one event is created
+- duplicate requests return the original event
+
+PostgreSQL unique constraints enforce correctness during concurrent requests.
+
+---
+
+# Performance (Phase 2)
+
+Load test:
+- 200 requests
+- 10 concurrent clients
+- warm Render instance
 
 | Metric | Latency |
-|--------|---------|
+|---|---|
 | p50 | 482ms |
 | p95 | 1140ms |
 | p99 | 1491ms |
 | Requests/sec | 16.5 |
 
-resp wait: 0.5152 secs average
+Average response wait:
+- 0.5152 seconds
 
-Note:
-- numbers reflect Render free tier constraints
-- API response time no longer includes webhook delivery latency
+Notes:
+- numbers reflect Render free tier limitations
+- API latency no longer includes webhook delivery time
 - webhook delivery is fully asynchronous
 
 ---
 
-## Known Limitations — Phase 1
+# Delivery Semantics
 
-- At-least-once delivery may produce duplicate webhook deliveries
-- No retry backoff strategy yet
-- No dead-letter queue support
-- Worker and API currently run inside same process
-- Redis Stream recovery/reconciliation jobs not implemented yet
-- No webhook signing/authentication
-- No rate limiting or tenant isolation
-- No observability stack yet
+The system currently provides:
 
----
+```text
+at-least-once delivery
+```
 
-## Failure Model
+This means:
+- events are not silently lost
+- duplicate webhook deliveries are still possible under failure conditions
 
-The system uses at-least-once delivery semantics.
+Example:
+- worker delivers webhook successfully
+- worker crashes before Redis ACK
+- another worker retries same event
 
-If a worker crashes after successfully delivering a webhook but before acknowledging the Redis Stream message, another worker may retry the same event. This prevents message loss but allows duplicate deliveries.
-
-PostgreSQL acts as the durable source of truth. Redis Streams are used as the asynchronous delivery mechanism.
+This is intentional and matches real-world distributed system trade-offs.
 
 ---
 
-## Deployment
+# Known Limitations
+
+Current limitations:
+- duplicate webhook deliveries are still possible
+- dead letter queue is represented as database state, not separate Redis stream
+- worker and API currently run inside same process
+- retry scheduler uses polling
+- no distributed rate limiting
+- no webhook signing/authentication yet
+- no tenant isolation
+- no observability stack yet
+- no replay tooling yet
+
+---
+
+# Failure Model
+
+PostgreSQL acts as the durable source of truth.
+
+Redis Streams are used for:
+- asynchronous delivery coordination
+- worker communication
+- message acknowledgment tracking
+
+If Redis loses transient stream state:
+- events still exist durably in PostgreSQL
+
+Retry scheduling state is currently stored in PostgreSQL using:
+- `attempt_count`
+- `next_retry_at`
+- `status`
+
+This keeps retry behavior durable across worker restarts and crashes.
+
+---
+
+# Deployment
 
 Deployed publicly on Render using:
 - FastAPI web service
 - managed PostgreSQL
 - managed Redis
 
-API and worker currently run concurrently inside the same asyncio event loop using:
+The worker loop and retry scheduler currently run inside the same asyncio application process using:
 
 ```python
 asyncio.create_task(worker_loop())
+asyncio.create_task(retry_loop())
 ```
