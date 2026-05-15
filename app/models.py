@@ -28,6 +28,7 @@ class Events(Base):
 
     url_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("endpoints.url_id"))
     event_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(unique=True)
     status: Mapped[str] = mapped_column(default="pending")
     payload: Mapped[dict] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

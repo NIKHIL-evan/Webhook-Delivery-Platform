@@ -126,7 +126,7 @@ async def retry_loop():
                 stm = select(Events).where(Events.status == "failed", Events.next_retry_at <= datetime.now(timezone.utc), Events.attempt_count < 5)
                 result = await session.execute(stm)
                 events = result.scalars().all()
-                print(f"retry_scheduler: found {len(events)} events to retry", flush=True)
+
                 for event in events:
                     url_id = event.url_id
                     event_id = event.event_id

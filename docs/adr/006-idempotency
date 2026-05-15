@@ -1,0 +1,106 @@
+# ADR 005: Idempotency Key Storage
+
+## Context
+
+Phase 2 adds idempotency support to the `POST /events` endpoint.
+
+Without idempotency, the same client request can create duplicate events if:
+- the client retries after a timeout
+- the network drops the response
+- two identical requests arrive at nearly the same time
+
+That would cause duplicate webhook deliveries, which is unacceptable for things like payments, emails, or order processing.
+
+We needed a way to ensure that the same logical request only creates one event.
+
+The options considered were:
+- PostgreSQL only
+- Redis only
+- hybrid Redis + PostgreSQL
+
+---
+
+## Decision
+
+Idempotency keys are currently stored in PostgreSQL as a unique nullable column on the `events` table.
+
+Current flow:
+1. client optionally sends an `idempotency_key`
+2. API checks whether an event with that key already exists
+3. if found, the existing event is returned
+4. otherwise a new event is created
+5. PostgreSQL unique constraint prevents duplicate inserts during race conditions
+
+The database constraint acts as the final protection layer if two identical requests hit the API simultaneously.
+
+---
+
+## Alternatives Considered
+
+### Redis-Only
+
+One option was storing keys in Redis like:
+
+```text
+idempotency:<key> -> event_id
+```
+
+Advantages:
+- very fast lookups
+- lower database load
+- simple key-value access pattern
+
+Rejected because:
+- Redis is not the durable source of truth
+- expired keys can allow duplicate requests later
+- adds another critical dependency
+- increases operational complexity early in the project
+
+For the current scale, the complexity was not justified.
+
+---
+
+### Hybrid Redis + PostgreSQL
+
+Another option was:
+- PostgreSQL stores durable idempotency state
+- Redis acts as a fast cache for recent lookups
+
+Flow:
+1. check Redis first
+2. fallback to PostgreSQL on cache miss
+3. populate Redis cache
+4. still rely on PostgreSQL unique constraint for correctness
+
+Advantages:
+- faster duplicate detection
+- reduced database lookup pressure
+- better performance at very high request rates
+
+Rejected for now because:
+- current throughput is low
+- there is no evidence yet that PostgreSQL is the bottleneck
+- cache consistency adds additional failure modes
+- complexity increases significantly
+
+This remains a valid optimization for a later scaling phase after load testing and measurement.
+
+---
+
+## Trade-offs Accepted
+
+Using PostgreSQL-only idempotency means:
+- every idempotent request performs a database lookup
+- simultaneous duplicate requests may still waste some application work before the unique constraint rejects one of them
+- lookups are slower than pure in-memory Redis access
+
+However, this approach gives:
+- strong durability
+- simpler architecture
+- fewer distributed consistency problems
+- easier debugging
+- lower operational overhead
+
+At the current stage of the project, simplicity and correctness are more important than speculative optimization.
+
+PostgreSQL remains the single source of truth for idempotency state.
