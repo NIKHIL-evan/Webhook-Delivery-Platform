@@ -1,32 +1,33 @@
-from fastapi import APIRouter, HTTPException
-from app.models import Endpoints
+from fastapi import APIRouter, HTTPException, Depends
+from app.models import Endpoint, Tenant
+from app.dependencies import get_current_tenant
 from pydantic import BaseModel
 from app.database import get_db
-from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import SQLAlchemyError 
+from sqlalchemy.exc import SQLAlchemyError
 
 router = APIRouter()
 
 class EndpointCreate(BaseModel):
-    url: str 
+    url: str
 
 @router.post("/endpoints")
-async def register_url(body: EndpointCreate, db: AsyncSession = Depends(get_db)):
+async def register_url(
+    body: EndpointCreate,
+    tenant: Tenant = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db)
+):
     try:
-        endpoint = Endpoints(url=body.url)
+        endpoint = Endpoint(url=body.url, tenant_id=tenant.id)
         db.add(endpoint)
         await db.commit()
         await db.refresh(endpoint)
         return {
-        "url_id": str(endpoint.url_id),
-        "url": endpoint.url,
-        "created_at": str(endpoint.created_at)
+            "endpoint_id": str(endpoint.id),
+            "url": endpoint.url,
+            "created_at": str(endpoint.created_at)
         }
-    except SQLAlchemyError:
+    except SQLAlchemyError as e:
+        print(f"DB ERROR: {e}", flush=True)
         await db.rollback()
-
-        raise HTTPException(
-            status_code=500,
-            detail="Database error"
-        )
+        raise HTTPException(status_code=500, detail="Database error")

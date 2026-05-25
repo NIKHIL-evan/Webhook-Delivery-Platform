@@ -126,3 +126,42 @@ The accepted side effect of at-least-once delivery is duplicate event delivery.
 **Impact:** Slow deliveries no longer block API requests, but workers may become occupied for longer periods.
 
 ```
+
+# Failure Modes — Phase 2
+
+## Duplicate Client Requests
+
+**What happens:**  
+Two identical client requests arrive simultaneously with the same idempotency key.
+
+**Current behavior:**  
+Both requests may pass the initial lookup check, but PostgreSQL unique constraints reject the duplicate insert during commit.
+
+**Impact:**  
+Some application work is wasted on the duplicate request, but only one event is ultimately created.
+
+---
+
+## Retry Storms
+
+**What happens:**  
+Large numbers of webhook deliveries fail simultaneously.
+
+**Current behavior:**  
+Retries are delayed using exponential backoff.
+
+**Impact:**  
+Backoff reduces immediate retry pressure, but large failure waves can still temporarily increase queue size and retry load.
+
+---
+
+## Infinite Retry Prevention
+
+**What happens:**  
+A webhook continuously fails permanently.
+
+**Current behavior:**  
+Retries stop after maximum retry attempts are exceeded and the event is marked `dead`.
+
+**Impact:**  
+The system avoids infinite retry loops and preserves failed event state for later inspection.

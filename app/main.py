@@ -2,7 +2,7 @@
 # Registers all routers and starts the server.
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
-from app.routers import endpoints, events, attempts
+from app.routers import endpoints, events, attempts, tenants, generate_key
 from app.redis_client import redis_client
 import asyncio
 from worker import worker_loop, retry_loop
@@ -30,3 +30,5 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(endpoints.router)
 app.include_router(events.router)
 app.include_router(attempts.router)
+app.include_router(tenants.router)
+app.include_router(generate_key.router)
