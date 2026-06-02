@@ -7,7 +7,6 @@ from sqlalchemy.exc import SQLAlchemyError
 from pydantic import BaseModel
 from fastapi import Depends
 import secrets
-from typing import Optional
 
 router = APIRouter()
 
