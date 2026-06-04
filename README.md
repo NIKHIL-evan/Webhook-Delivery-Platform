@@ -1,27 +1,46 @@
 # Webhook Delivery Platform
 
-A self-hostable webhook delivery platform built with FastAPI, PostgreSQL, Redis Streams, and asynchronous worker-based processing. Clients can register destination webhook URLs, submit JSON events, and the system reliably delivers them as HTTP POST requests. The platform includes asynchronous processing, retry scheduling, dead letter handling, delivery attempt tracking, and idempotency protection.
+A self-hostable webhook delivery platform built with FastAPI, PostgreSQL, Redis Streams, and asynchronous worker-based processing.
+
+Clients can:
+
+* Register webhook endpoints
+* Create events
+* Deliver events asynchronously
+* Retry failed deliveries with exponential backoff
+* Track delivery attempts
+* Use idempotency keys
+* Authenticate using API keys
+* Operate in isolated multi-tenant environments
+* Receive HMAC-signed webhook requests
+
+The platform follows an at-least-once delivery model similar to production webhook systems.
 
 ---
 
 # Status
 
-Phase 2 — reliability and retry semantics implemented.
+Phase 3 — Multi-Tenancy and Security Implemented
 
 Implemented:
-- REST API with FastAPI
-- PostgreSQL schema design with foreign keys and UUID primary keys
-- Async SQLAlchemy integration
-- Redis Streams with consumer groups
-- Background worker loop using asyncio
-- Asynchronous webhook delivery
-- Delivery attempt tracking
-- Retry scheduling with exponential backoff
-- Dead letter state handling
-- Idempotency key support
-- Failure tracking and retry persistence
-- Public deployment on Render
-- Basic load testing and performance measurement
+
+* FastAPI REST API
+* PostgreSQL persistence
+* Async SQLAlchemy integration
+* Redis Streams
+* Redis consumer groups
+* Background worker processing
+* Retry scheduler
+* Exponential backoff retries
+* Dead letter handling
+* Delivery attempt tracking
+* Idempotency key support
+* API key authentication
+* Tenant isolation
+* HMAC webhook signing
+* Per-tenant rate limiting
+* Async webhook delivery
+* Public deployment on Render
 
 ---
 
@@ -30,15 +49,23 @@ Implemented:
 ```text
 Client
    ↓
+API Key Authentication
+   ↓
+Tenant Resolution
+   ↓
+Rate Limiting
+   ↓
 FastAPI API Server
    ↓
-PostgreSQL (durable source of truth)
+PostgreSQL (Source of Truth)
    ↓
-Redis Stream (async delivery queue)
+Redis Streams
    ↓
-Worker Loop
+Consumer Group Workers
    ↓
-Destination Webhook
+HMAC Signed Webhook Delivery
+   ↓
+Destination Endpoint
 ```
 
 Retry flow:
@@ -46,253 +73,339 @@ Retry flow:
 ```text
 delivery fails
     ↓
-event marked failed
+delivery attempt persisted
     ↓
 next_retry_at scheduled
     ↓
-retry scheduler re-enqueues event
+retry scheduler
     ↓
-worker retries delivery
+event re-enqueued
     ↓
-max retries exceeded
+worker retries
+    ↓
+max attempts reached
     ↓
 event marked dead
 ```
 
 ---
 
-# Local Setup
+# Features
 
-## 1. Clone the repository
+## Async Delivery
 
-```bash
-git clone <repo-url>
-cd webhook-delivery-platform
+Webhook delivery occurs asynchronously using Redis Streams and background workers.
+
+API response latency does not include webhook delivery time.
+
+---
+
+## Consumer Groups
+
+Redis consumer groups provide:
+
+* worker coordination
+* horizontal scalability
+* pending message tracking
+* message ownership
+
+---
+
+## Delivery Tracking
+
+Every delivery attempt is persisted.
+
+Stored information includes:
+
+* attempt number
+* response status code
+* delivery status
+* delivery timestamp
+
+---
+
+## Retry Scheduling
+
+Failed deliveries are retried using exponential backoff.
+
+Current behavior:
+
+```text
+attempt 1 → 2 seconds
+attempt 2 → 4 seconds
+attempt 3 → 8 seconds
+attempt 4 → 16 seconds
+...
 ```
 
-## 2. Create virtual environment
+---
 
-```bash
-python -m venv venv
-source venv/bin/activate
+## Dead Letter Handling
+
+Events exceeding maximum retry attempts are marked:
+
+```text
+dead
 ```
 
-## 3. Install dependencies
+Dead events remain queryable for debugging and inspection.
 
-```bash
-pip install -r requirements.txt
+---
+
+## Idempotency
+
+Clients may provide:
+
+```json
+{
+  "idempotency_key": "client-key"
+}
 ```
 
-## 4. Create PostgreSQL database
+Duplicate submissions return the original event.
 
-```bash
-sudo -u postgres createdb webhook_delivery
+PostgreSQL unique constraints enforce correctness.
+
+---
+
+# Security Features
+
+## API Keys
+
+Each tenant receives API keys for authentication.
+
+Keys are:
+
+* generated securely
+* hashed before storage
+* validated on every request
+
+---
+
+## Tenant Isolation
+
+Resources belong to a tenant.
+
+A tenant cannot:
+
+* access another tenant's endpoints
+* create events against another tenant's resources
+* bypass ownership checks
+
+---
+
+## HMAC Signing
+
+Outbound webhook deliveries are signed using:
+
+```text
+HMAC-SHA256
 ```
 
-## 5. Configure environment variables
+Every webhook contains:
 
-Create a `.env` file:
-
-```env
-DATABASE_URL=postgresql+asyncpg://postgres:<password>@localhost:5432/webhook_delivery
-REDIS_URL=redis://localhost:6379
+```text
+X-Webhook-Signature
 ```
 
-## 6. Run Redis locally
+Receivers can verify authenticity and payload integrity.
 
-```bash
-sudo apt install redis-server
-sudo systemctl start redis-server
+---
+
+## Rate Limiting
+
+Rate limiting is enforced per tenant using Redis.
+
+Current implementation:
+
+```text
+fixed window
+60 second interval
+per-tenant counters
 ```
 
-## 7. Run migrations
+Requests exceeding limits receive:
 
-```bash
-alembic upgrade head
-```
-
-## 8. Start the application
-
-```bash
-uvicorn app.main:app --reload
+```http
+429 Too Many Requests
 ```
 
 ---
 
 # API Endpoints
 
+## POST /tenants
+
+Creates a tenant.
+
+---
+
+## POST /tenants/{tenant_id}/api-keys
+
+Generates an API key for a tenant.
+
+---
+
 ## POST /endpoints
 
-Registers a destination webhook URL.
+Registers a webhook endpoint.
 
-Request:
-
-```json
-{
-  "url": "https://example.com/webhook"
-}
-```
+Authentication required.
 
 ---
 
 ## POST /events
 
-Creates an event and asynchronously schedules webhook delivery.
+Creates an event and schedules delivery.
 
-Request:
-
-```json
-{
-  "url_id": "<endpoint-uuid>",
-  "payload": {
-    "message": "hello world"
-  },
-  "idempotency_key": "optional-client-key"
-}
-```
-
-Behavior:
-- validates endpoint exists
-- checks idempotency key if provided
-- stores event in PostgreSQL
-- writes delivery job into Redis Stream
-- worker asynchronously delivers webhook
-- failed deliveries are retried with backoff
-- delivery attempts are persisted
+Authentication required.
 
 ---
 
 ## GET /events/{event_id}/delivery_attempts
 
-Fetches all delivery attempts associated with an event.
-
----
-
-# Reliability Features (Phase 2)
-
-## Retry Scheduling
-
-Failed deliveries are retried using exponential backoff.
-
-Current retry flow:
-- attempt 1 → retry after 2 seconds
-- attempt 2 → retry after 4 seconds
-- attempt 3 → retry after 8 seconds
-- etc.
-
----
-
-## Dead Letter Handling
-
-Events stop retrying after reaching maximum retry attempts.
-
-Dead events remain persisted in PostgreSQL for inspection and debugging.
-
----
-
-## Idempotency
-
-Clients may optionally send an `idempotency_key`.
-
-If the same key is submitted multiple times:
-- only one event is created
-- duplicate requests return the original event
-
-PostgreSQL unique constraints enforce correctness during concurrent requests.
-
----
-
-# Performance (Phase 2)
-
-Load test:
-- 200 requests
-- 10 concurrent clients
-- warm Render instance
-
-| Metric | Latency |
-|---|---|
-| p50 | 482ms |
-| p95 | 1140ms |
-| p99 | 1491ms |
-| Requests/sec | 16.5 |
-
-Average response wait:
-- 0.5152 seconds
-
-Notes:
-- numbers reflect Render free tier limitations
-- API latency no longer includes webhook delivery time
-- webhook delivery is fully asynchronous
+Returns delivery history for an event.
 
 ---
 
 # Delivery Semantics
 
-The system currently provides:
+Current guarantee:
 
 ```text
-at-least-once delivery
+At-Least-Once Delivery
 ```
 
-This means:
-- events are not silently lost
-- duplicate webhook deliveries are still possible under failure conditions
+Implications:
+
+* events are not silently lost
+* duplicate deliveries are possible
 
 Example:
-- worker delivers webhook successfully
-- worker crashes before Redis ACK
-- another worker retries same event
 
-This is intentional and matches real-world distributed system trade-offs.
+```text
+worker sends webhook
+      ↓
+destination receives webhook
+      ↓
+worker crashes before ACK
+      ↓
+message reprocessed
+      ↓
+duplicate delivery
+```
+
+This is an intentional distributed-systems trade-off.
+
+---
+
+# Performance
+
+Phase 3 Benchmark
+
+Environment:
+
+* Local PostgreSQL
+* Local Redis
+* API authentication enabled
+* Tenant isolation enabled
+* Rate limiting enabled
+* Worker processing active
+
+Load test:
+- 1000 requests
+- 10 concurrent clients
+- local PostgreSQL
+- local Redis
+- worker processing active
+
+| Metric | Result |
+|----------|----------|
+| p50 | 83.93 ms |
+| p95 | 141.06 ms |
+| p99 | 203.94 ms |
+| Requests/sec | 109.05 |
+
+Success Rate:
+100%
+
+Failures:
+0
+
+Delivery Attempts:
+1001
+
+Delivered Events:
+1001
+
+Notes:
+
+* webhook delivery remained asynchronous
+* worker processing was active during benchmark
+* benchmark includes authentication and rate-limiting overhead
+
+---
+
+# Failure Model
+
+PostgreSQL is the durable source of truth.
+
+Redis Streams provide:
+
+* asynchronous processing
+* worker coordination
+* pending entry tracking
+* delivery acknowledgment
+
+If Redis stream state is lost:
+
+* events remain persisted in PostgreSQL
+* retry scheduler can recover pending work
 
 ---
 
 # Known Limitations
 
 Current limitations:
-- duplicate webhook deliveries are still possible
-- dead letter queue is represented as database state, not separate Redis stream
-- worker and API currently run inside same process
-- retry scheduler uses polling
-- no distributed rate limiting
-- no webhook signing/authentication yet
-- no tenant isolation
-- no observability stack yet
-- no replay tooling yet
 
----
-
-# Failure Model
-
-PostgreSQL acts as the durable source of truth.
-
-Redis Streams are used for:
-- asynchronous delivery coordination
-- worker communication
-- message acknowledgment tracking
-
-If Redis loses transient stream state:
-- events still exist durably in PostgreSQL
-
-Retry scheduling state is currently stored in PostgreSQL using:
-- `attempt_count`
-- `next_retry_at`
-- `status`
-
-This keeps retry behavior durable across worker restarts and crashes.
+* duplicate deliveries remain possible
+* dead letter queue is represented as database state
+* retry scheduler uses polling
+* worker and API run in the same process
+* no observability stack yet
+* no replay tooling yet
+* no tracing implementation yet
+* no metrics dashboard yet
 
 ---
 
 # Deployment
 
-Deployed publicly on Render using:
-- FastAPI web service
-- managed PostgreSQL
-- managed Redis
+Deployed on Render using:
 
-The worker loop and retry scheduler currently run inside the same asyncio application process using:
+* FastAPI Web Service
+* Managed PostgreSQL
+* Managed Redis
+
+Background services:
 
 ```python
 asyncio.create_task(worker_loop())
 asyncio.create_task(retry_loop())
 ```
+
+---
+
+# Next Phase
+
+Phase 4 — Observability
+
+Planned additions:
+
+* structured logging
+* metrics
+* tracing
+* delivery dashboards
+* operational visibility
+* failure analytics
+* performance monitoring

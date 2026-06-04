@@ -23,7 +23,8 @@ async def register_tenant(body: TenantCreate, db: AsyncSession = Depends(get_db)
         await db.refresh(tenant)
         return {
             "id": str(tenant.id),
-            "name": str(tenant.name)
+            "name": str(tenant.name),
+            "signing_secret": secret
         }
     except SQLAlchemyError:
         await db.rollback()
