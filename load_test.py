@@ -1,11 +1,10 @@
 import asyncio
 import aiohttp
 import time
-import statistics
 from collections import Counter
 
-API_KEY = "wh_live_tU_mNcqD59YSeRqpq-tQTPnndDEoPnql2uJdYfR-lwI"
-ENDPOINT_ID = "4e0d0363-5279-49f4-a5b6-9233447bc065"
+API_KEY = "wh_live_72kRQZ8oIvabdiKU9jSPu7YsM67cn97soppDTRM3Rn4"
+ENDPOINT_ID = "30a302d3-926b-429b-9f64-25d056e2b194"
 
 URL = "http://localhost:8000/events"
 

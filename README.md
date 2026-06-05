@@ -2,44 +2,37 @@
 
 A self-hostable webhook delivery platform built with FastAPI, PostgreSQL, Redis Streams, and asynchronous worker-based processing.
 
-Clients can:
+The platform accepts events, persists them durably, delivers them asynchronously, retries failures with exponential backoff, and provides operational visibility through logs, metrics, tracing, and health endpoints.
 
-* Register webhook endpoints
-* Create events
-* Deliver events asynchronously
-* Retry failed deliveries with exponential backoff
-* Track delivery attempts
-* Use idempotency keys
-* Authenticate using API keys
-* Operate in isolated multi-tenant environments
-* Receive HMAC-signed webhook requests
-
-The platform follows an at-least-once delivery model similar to production webhook systems.
+The architecture follows an **at-least-once delivery model**, similar to production webhook systems such as Stripe, GitHub, and Shopify.
 
 ---
 
-# Status
+# Current Status
 
-Phase 3 — Multi-Tenancy and Security Implemented
+## Phase 4 — Observability Complete
 
-Implemented:
+Completed:
 
 * FastAPI REST API
 * PostgreSQL persistence
-* Async SQLAlchemy integration
 * Redis Streams
-* Redis consumer groups
-* Background worker processing
+* Redis Consumer Groups
+* Async worker-based delivery
 * Retry scheduler
 * Exponential backoff retries
-* Dead letter handling
+* Dead-letter handling
 * Delivery attempt tracking
-* Idempotency key support
+* Idempotency keys
 * API key authentication
 * Tenant isolation
 * HMAC webhook signing
 * Per-tenant rate limiting
-* Async webhook delivery
+* Structured logging
+* Trace IDs
+* Health endpoints
+* Metrics endpoints
+* Operational diagnostics
 * Public deployment on Render
 
 ---
@@ -68,75 +61,102 @@ HMAC Signed Webhook Delivery
 Destination Endpoint
 ```
 
-Retry flow:
+---
+
+# Event Lifecycle
 
 ```text
-delivery fails
-    ↓
-delivery attempt persisted
-    ↓
+Client creates event
+      ↓
+Event persisted in PostgreSQL
+      ↓
+Event published to Redis Stream
+      ↓
+Worker consumes message
+      ↓
+Webhook delivered
+      ↓
+Success
+      ↓
+ACK message
+      ↓
+Event marked delivered
+```
+
+Failure path:
+
+```text
+Delivery fails
+      ↓
+Delivery attempt persisted
+      ↓
 next_retry_at scheduled
-    ↓
-retry scheduler
-    ↓
-event re-enqueued
-    ↓
-worker retries
-    ↓
-max attempts reached
-    ↓
-event marked dead
+      ↓
+Retry scheduler
+      ↓
+Event re-enqueued
+      ↓
+Worker retries
+      ↓
+Maximum attempts reached
+      ↓
+Event marked dead
 ```
 
 ---
 
 # Features
 
-## Async Delivery
+## Asynchronous Delivery
 
-Webhook delivery occurs asynchronously using Redis Streams and background workers.
+Webhook delivery occurs entirely in background workers.
 
-API response latency does not include webhook delivery time.
+API latency does not include webhook delivery time.
+
+This prevents slow customer endpoints from impacting API responsiveness.
 
 ---
 
-## Consumer Groups
+## Redis Consumer Groups
 
-Redis consumer groups provide:
+Consumer groups provide:
 
 * worker coordination
 * horizontal scalability
-* pending message tracking
 * message ownership
+* pending message tracking
+* fault recovery
 
 ---
 
-## Delivery Tracking
+## Delivery Attempt Tracking
 
 Every delivery attempt is persisted.
 
 Stored information includes:
 
 * attempt number
-* response status code
-* delivery status
-* delivery timestamp
+* status
+* response code
+* timestamp
 
 ---
 
-## Retry Scheduling
+## Exponential Backoff Retries
 
-Failed deliveries are retried using exponential backoff.
+Failed deliveries are retried automatically.
 
-Current behavior:
+Current retry schedule:
 
 ```text
-attempt 1 → 2 seconds
-attempt 2 → 4 seconds
-attempt 3 → 8 seconds
-attempt 4 → 16 seconds
-...
+Attempt 1 → 2 seconds
+Attempt 2 → 4 seconds
+Attempt 3 → 8 seconds
+Attempt 4 → 16 seconds
+Attempt 5 → Dead
 ```
+
+Jitter is added to reduce retry synchronization.
 
 ---
 
@@ -158,25 +178,25 @@ Clients may provide:
 
 ```json
 {
-  "idempotency_key": "client-key"
+  "idempotency_key": "client-generated-key"
 }
 ```
 
-Duplicate submissions return the original event.
+Duplicate submissions return the original event rather than creating a new one.
 
-PostgreSQL unique constraints enforce correctness.
+Correctness is enforced through PostgreSQL uniqueness constraints.
 
 ---
 
-# Security Features
+# Security
 
-## API Keys
+## API Key Authentication
 
-Each tenant receives API keys for authentication.
+Each tenant receives API keys.
 
 Keys are:
 
-* generated securely
+* securely generated
 * hashed before storage
 * validated on every request
 
@@ -189,12 +209,12 @@ Resources belong to a tenant.
 A tenant cannot:
 
 * access another tenant's endpoints
-* create events against another tenant's resources
+* create events for another tenant
 * bypass ownership checks
 
 ---
 
-## HMAC Signing
+## HMAC Webhook Signing
 
 Outbound webhook deliveries are signed using:
 
@@ -202,26 +222,30 @@ Outbound webhook deliveries are signed using:
 HMAC-SHA256
 ```
 
-Every webhook contains:
+Every delivery contains:
 
 ```text
 X-Webhook-Signature
 ```
 
-Receivers can verify authenticity and payload integrity.
+Receivers can verify:
+
+* authenticity
+* integrity
+* source trustworthiness
 
 ---
 
 ## Rate Limiting
 
-Rate limiting is enforced per tenant using Redis.
+Per-tenant rate limiting is enforced using Redis.
 
 Current implementation:
 
 ```text
-fixed window
-60 second interval
-per-tenant counters
+Fixed Window
+60-second window
+Tenant-scoped counters
 ```
 
 Requests exceeding limits receive:
@@ -232,23 +256,133 @@ Requests exceeding limits receive:
 
 ---
 
+# Observability
+
+## Structured Logging
+
+Workers emit structured JSON logs.
+
+Example:
+
+```json
+{
+  "worker":"worker-1",
+  "trace_id":"...",
+  "event_id":"...",
+  "event":"delivery_successful"
+}
+```
+
+---
+
+## Distributed Tracing
+
+Every event receives a trace identifier.
+
+Trace IDs propagate through:
+
+```text
+Event Creation
+      ↓
+Redis Stream
+      ↓
+Worker Processing
+      ↓
+Webhook Delivery
+      ↓
+Retry Scheduling
+```
+
+This enables reconstruction of the complete event lifecycle.
+
+---
+
+## Health Endpoints
+
+### GET /health
+
+Liveness probe.
+
+Used by:
+
+* load balancers
+* Render
+* container platforms
+
+Response:
+
+```json
+{
+  "status":"healthy"
+}
+```
+
+---
+
+### GET /health/details
+
+Operational diagnostics endpoint.
+
+Reports:
+
+* PostgreSQL status
+* Redis status
+* Worker status
+* Retry scheduler status
+
+Possible states:
+
+```text
+healthy
+degraded
+unhealthy
+```
+
+Health policy:
+
+```text
+PostgreSQL down → Unhealthy
+Redis down      → Unhealthy
+Workers down    → Degraded
+Retry loop down → Degraded
+```
+
+---
+
+## Metrics
+
+### GET /metrics/summary
+
+Current metrics:
+
+* events_created
+* events_delivered
+* delivery_attempts
+* events_failed
+* events_dead
+* pending_messages
+
+Provides a lightweight operational dashboard.
+
+---
+
 # API Endpoints
 
 ## POST /tenants
 
-Creates a tenant.
+Create tenant.
 
 ---
 
 ## POST /tenants/{tenant_id}/api-keys
 
-Generates an API key for a tenant.
+Generate API key.
 
 ---
 
 ## POST /endpoints
 
-Registers a webhook endpoint.
+Register webhook endpoint.
 
 Authentication required.
 
@@ -256,7 +390,7 @@ Authentication required.
 
 ## POST /events
 
-Creates an event and schedules delivery.
+Create event and schedule delivery.
 
 Authentication required.
 
@@ -264,8 +398,74 @@ Authentication required.
 
 ## GET /events/{event_id}/delivery_attempts
 
-Returns delivery history for an event.
+Retrieve delivery history.
 
+---
+
+## GET /health
+
+Liveness probe.
+
+Used by:
+
+- load balancers
+- Render health checks
+- container orchestration systems
+
+Response:
+
+```json
+{
+  "status": "healthy"
+}
+---
+
+GET /health/details
+
+Detailed readiness endpoint.
+
+Reports:
+
+PostgreSQL connectivity
+Redis connectivity
+Worker heartbeat status
+Retry scheduler heartbeat status
+
+Possible system states:
+
+healthy
+degraded
+unhealthy
+
+Returns:
+
+{
+  "status": "healthy",
+  "postgres": "up",
+  "redis": "up",
+  "worker_loop": "up",
+  "retry_loop": "up",
+  "timestamp": "2026-06-05T20:21:26.248543Z"
+}
+
+Returns HTTP 503 when critical dependencies are unavailable.
+---
+
+GET /metrics/summary
+
+Lightweight operational metrics endpoint.
+
+Returns:
+
+{
+  "events_created": 1001,
+  "events_delivered": 1001,
+  "delivery_attempts": 1001,
+  "events_failed": 0,
+  "events_dead": 0,
+  "pending_messages": 0,
+  "timestamp": "2026-06-05T20:21:26.248543Z"
+}
 ---
 
 # Delivery Semantics
@@ -284,15 +484,15 @@ Implications:
 Example:
 
 ```text
-worker sends webhook
+Webhook sent
       ↓
-destination receives webhook
+Receiver gets request
       ↓
-worker crashes before ACK
+Worker crashes before ACK
       ↓
-message reprocessed
+Message reprocessed
       ↓
-duplicate delivery
+Duplicate delivery
 ```
 
 This is an intentional distributed-systems trade-off.
@@ -301,48 +501,75 @@ This is an intentional distributed-systems trade-off.
 
 # Performance
 
-Phase 3 Benchmark
+## Phase 3 Baseline
 
 Environment:
 
 * Local PostgreSQL
 * Local Redis
-* API authentication enabled
+* Authentication enabled
 * Tenant isolation enabled
 * Rate limiting enabled
-* Worker processing active
 
-Load test:
-- 1000 requests
-- 10 concurrent clients
-- local PostgreSQL
-- local Redis
-- worker processing active
+Load:
 
-| Metric | Result |
-|----------|----------|
-| p50 | 83.93 ms |
-| p95 | 141.06 ms |
-| p99 | 203.94 ms |
-| Requests/sec | 109.05 |
+* 1000 requests
+* 10 concurrent clients
 
-Success Rate:
-100%
+| Metric       | Result    |
+| ------------ | --------- |
+| p50          | 83.93 ms  |
+| p95          | 141.06 ms |
+| p99          | 203.94 ms |
+| Requests/sec | 109.05    |
 
-Failures:
-0
+---
 
-Delivery Attempts:
-1001
+## Phase 4 Baseline
 
-Delivered Events:
-1001
+Environment:
 
-Notes:
+* Local PostgreSQL
+* Local Redis Streams
+* Async workers
+* Retry scheduler
+* API authentication
+* HMAC signing
+* Structured logging
+* Tracing
+* Metrics
+* Health checks
 
-* webhook delivery remained asynchronous
-* worker processing was active during benchmark
-* benchmark includes authentication and rate-limiting overhead
+Load:
+
+* 1000 requests
+* 10 concurrent clients
+
+| Metric       | Result    |
+| ------------ | --------- |
+| p50          | 83.97 ms  |
+| p95          | 130.35 ms |
+| p99          | 187.96 ms |
+| Requests/sec | 110.88    |
+
+Operational Metrics:
+
+```text
+Events Created     : 1001
+Events Delivered   : 1001
+Delivery Attempts  : 1001
+Failed Events      : 0
+Dead Events        : 0
+Pending Messages   : 0
+```
+
+Observations:
+
+* 100% successful event delivery
+* Worker throughput matched event creation rate
+* No queue backlog accumulated
+* No retries required
+* Observability overhead had negligible impact on latency
 
 ---
 
@@ -354,13 +581,18 @@ Redis Streams provide:
 
 * asynchronous processing
 * worker coordination
-* pending entry tracking
-* delivery acknowledgment
+* pending-entry tracking
+* acknowledgment semantics
+
+If worker processes fail:
+
+* events remain persisted
+* retry scheduler can recover failed deliveries
 
 If Redis stream state is lost:
 
-* events remain persisted in PostgreSQL
-* retry scheduler can recover pending work
+* events remain in PostgreSQL
+* recovery remains possible through persisted state
 
 ---
 
@@ -369,13 +601,14 @@ If Redis stream state is lost:
 Current limitations:
 
 * duplicate deliveries remain possible
-* dead letter queue is represented as database state
+* dead-letter handling is database-state based
 * retry scheduler uses polling
-* worker and API run in the same process
-* no observability stack yet
-* no replay tooling yet
-* no tracing implementation yet
-* no metrics dashboard yet
+* worker and API execute in the same process
+* Redis stream retention policy not implemented
+* metrics stored in Redis rather than Prometheus
+* tracing is application-level rather than OpenTelemetry-based
+* replay tooling not implemented
+* load testing performed only on local infrastructure
 
 ---
 
@@ -387,7 +620,7 @@ Deployed on Render using:
 * Managed PostgreSQL
 * Managed Redis
 
-Background services:
+Background processes:
 
 ```python
 asyncio.create_task(worker_loop())
@@ -398,14 +631,28 @@ asyncio.create_task(retry_loop())
 
 # Next Phase
 
-Phase 4 — Observability
+## Phase 5 — Scale
 
-Planned additions:
+Planned work:
 
-* structured logging
-* metrics
-* tracing
-* delivery dashboards
-* operational visibility
-* failure analytics
-* performance monitoring
+* throughput bottleneck analysis
+* worker horizontal scaling
+* Redis optimization
+* PostgreSQL optimization
+* stream retention policies
+* capacity planning
+* larger-scale load testing
+* benchmark publication
+* performance tuning based on measured bottlenecks
+
+Principle:
+
+```text
+Measure
+    ↓
+Identify Bottleneck
+    ↓
+Optimize
+    ↓
+Measure Again
+```

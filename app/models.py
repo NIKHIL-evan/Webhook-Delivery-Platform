@@ -43,6 +43,7 @@ class Event(Base):
     idempotency_key: Mapped[Optional[str]] = mapped_column(unique=True)
     status: Mapped[str] = mapped_column(default="pending")
     payload: Mapped[dict] = mapped_column(JSONB)
+    trace_id: Mapped[Optional[str]] = mapped_column(String, index=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
     attempt_count: Mapped[int] = mapped_column(default=0)

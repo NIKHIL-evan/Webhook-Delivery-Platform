@@ -9,6 +9,8 @@ import uuid
 from typing import Optional
 from sqlalchemy import select
 from app.redis_client import redis_client
+from app.telemetry import request_trace_id
+import asyncio
 
 router = APIRouter()
 
@@ -23,6 +25,8 @@ async def register_event(
     tenant: Tenant = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db), 
 ):
+    current_trace_id = request_trace_id.get()
+
     try:
         smt = select(Endpoint).where(
             Endpoint.id == body.endpoint_id,
@@ -65,25 +69,39 @@ async def register_event(
             tenant_id=tenant.id, 
             endpoint_id=body.endpoint_id, 
             payload=body.payload, 
-            idempotency_key=body.idempotency_key
+            idempotency_key=body.idempotency_key,
+            trace_id=current_trace_id
         )
         db.add(event)
         await db.commit()
         await db.refresh(event)
     except SQLAlchemyError:
         await db.rollback()
+        print("\n" + "=" * 80)
+        print("EVENT CREATION ERROR")
+        print(type(e).__name__)
+        print(str(e))
+        print("=" * 80 + "\n")
+
         raise HTTPException(
             status_code=500,
-            detail="Database error while saving event"
+            detail=f"Database error: {type(e).__name__}"
         )
     
     try:
         await redis_client.xadd(
             "webhook_events", 
-            {"event_id": str(event.id), "endpoint_id": str(body.endpoint_id)}
+            {"event_id": str(event.id), "endpoint_id": str(body.endpoint_id), "trace_id": current_trace_id}
         )
-    except Exception:
-        pass
+        asyncio.create_task(redis_client.incr("metrics:events_created"))
+    except Exception as e:
+        # Note: This introduces a known dual-write edge case (event is in DB, but not in queue).
+        # For now, we must at least alert the client that scheduling failed.
+        raise HTTPException(
+            status_code=500,
+            detail="Event saved but failed to enqueue for delivery."
+        )
+        
 
     return {
         "event_id": str(event.id),

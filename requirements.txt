@@ -9,3 +9,4 @@ redis
 alembic
 psycopg2-binary
 aiohttp
+structlog
