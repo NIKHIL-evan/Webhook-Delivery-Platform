@@ -8,6 +8,7 @@ from app.routers import endpoints, events, attempts, tenants, generate_key, obse
 from app.redis_client import redis_client
 import asyncio
 from worker import worker_loop, retry_loop
+from app.middleware import metrics_middleware
 
 class TraceMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -42,13 +43,19 @@ async def lifespan(app: FastAPI):
         if "BUSYGROUP" not in str(e):
             raise
     
-    asyncio.create_task(worker_loop())
+    asyncio.create_task(worker_loop("worker-1"))
+    asyncio.create_task(worker_loop("worker-2"))
+    asyncio.create_task(worker_loop("worker-3"))
+    asyncio.create_task(worker_loop("worker-4"))
+    asyncio.create_task(worker_loop("worker-5"))
+    asyncio.create_task(worker_loop("worker-6"))
     asyncio.create_task(retry_loop())
 
     yield
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(TraceMiddleware)
+app.middleware("http")(metrics_middleware)
 app.include_router(endpoints.router)
 app.include_router(events.router)
 app.include_router(attempts.router)

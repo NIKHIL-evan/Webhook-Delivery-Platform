@@ -10,7 +10,7 @@ The architecture follows an **at-least-once delivery model**, similar to product
 
 # Current Status
 
-## Phase 4 — Observability Complete
+## Phase 5 — Performance Analysis In Progress
 
 Completed:
 
@@ -361,8 +361,31 @@ Current metrics:
 * events_failed
 * events_dead
 * pending_messages
+* avg_api_latency_ms
+* avg_queue_delay_ms
+* max_queue_delay_ms
 
-Provides a lightweight operational dashboard.
+Operational metrics are stored in Redis and exposed through:
+
+GET /metrics/summary
+
+Metric Definitions
+
+API Latency
+    Time spent processing a request inside FastAPI.
+
+Queue Delay
+    Time between enqueueing an event into Redis Streams and a worker beginning processing.
+
+Max Queue Delay
+    Worst observed queue wait time.
+
+These metrics allow independent measurement of:
+
+- API performance
+- Worker throughput
+- Queue buildup
+- System saturation
 
 ---
 
@@ -629,30 +652,73 @@ asyncio.create_task(retry_loop())
 
 ---
 
-# Next Phase
+Phase 5 Scaling Analysis
 
-## Phase 5 — Scale
+Environment:
 
-Planned work:
+Local PostgreSQL
+Local Redis
+Consumer Groups
+HMAC Signing
+Structured Logging
+Tracing
+Metrics
+Health Checks
 
-* throughput bottleneck analysis
-* worker horizontal scaling
-* Redis optimization
-* PostgreSQL optimization
-* stream retention policies
-* capacity planning
-* larger-scale load testing
-* benchmark publication
-* performance tuning based on measured bottlenecks
+Load:
 
-Principle:
+10,000 requests
+10 concurrent clients
+Worker Scaling Results
+Workers	Avg API Latency	p95 Latency	Requests/sec	Avg Queue Delay	Max Queue Delay
+2	32.64 ms	127.83 ms	124.39	25.96 s	39.66 s
+4	44.31 ms	139.88 ms	106.25	9.08 s	16.92 s
+6	47.12 ms	112.02 ms	101.77	10.47 ms	84 ms
+8	53.42 ms	123.97 ms	94.90	11.57 ms	86 ms
+Findings
+API Was Not The Bottleneck
 
-```text
-Measure
-    ↓
-Identify Bottleneck
-    ↓
-Optimize
-    ↓
-Measure Again
-```
+API latency remained below:
+
+55 ms
+
+under sustained 10,000-event load.
+
+Worker Throughput Was The Initial Bottleneck
+
+With 2 workers:
+
+Average Queue Delay: 25.96 seconds
+
+Events accumulated faster than workers could process them.
+
+Additional Workers Reduced Queue Buildup
+2 workers → 25.96s queue delay
+4 workers → 9.08s queue delay
+6 workers → 10ms queue delay
+
+At 6 workers the consumer throughput approximately matched event creation throughput.
+
+Diminishing Returns After 6 Workers
+
+Increasing workers:
+
+6 → 8
+
+produced no meaningful queue-delay improvement while increasing API latency and reducing request throughput.
+
+Resource Contention Appeared
+
+After queue buildup disappeared, additional workers began competing for:
+
+PostgreSQL connections
+Redis operations
+CPU scheduling
+Event-loop execution time
+Conclusion
+
+For the current machine and workload:
+
+6 workers ≈ optimal operating point
+
+Beyond that point, additional workers increase system overhead without improving delivery performance.

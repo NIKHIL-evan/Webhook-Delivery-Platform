@@ -11,6 +11,7 @@ from sqlalchemy import select
 from app.redis_client import redis_client
 from app.telemetry import request_trace_id
 import asyncio
+import time
 
 router = APIRouter()
 
@@ -90,8 +91,13 @@ async def register_event(
     
     try:
         await redis_client.xadd(
-            "webhook_events", 
-            {"event_id": str(event.id), "endpoint_id": str(body.endpoint_id), "trace_id": current_trace_id}
+            "webhook_events",
+            {
+                "event_id": str(event.id),
+                "endpoint_id": str(endpoint.id),
+                "trace_id": str(current_trace_id),
+                "queued_at": str(time.time())
+            }
         )
         asyncio.create_task(redis_client.incr("metrics:events_created"))
     except Exception as e:

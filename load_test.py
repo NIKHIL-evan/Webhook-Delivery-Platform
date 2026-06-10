@@ -3,8 +3,8 @@ import aiohttp
 import time
 from collections import Counter
 
-API_KEY = "wh_live_72kRQZ8oIvabdiKU9jSPu7YsM67cn97soppDTRM3Rn4"
-ENDPOINT_ID = "30a302d3-926b-429b-9f64-25d056e2b194"
+API_KEY = "wh_live_F1Gx9zkHO4qGfiuuIEi1PWi6gV7zrclLQ5zhdkkeNHk"
+ENDPOINT_ID = "2232c8f6-71a9-4a58-9b0b-76585a0845ca"
 
 URL = "http://localhost:8000/events"
 
@@ -35,7 +35,7 @@ async def main():
     start = time.perf_counter()
 
     async with aiohttp.ClientSession() as session:
-        tasks = [send_request(session, i) for i in range(1000)]
+        tasks = [send_request(session, i) for i in range(10000)]
         results = await asyncio.gather(*tasks)
 
     end = time.perf_counter()

@@ -111,11 +111,35 @@ async def get_metrics():
         "metrics:events_delivered_total", 
         "metrics:delivery_attempts",
         "metrics:events_failed_total", 
-        "metrics:events_dead_total"
+        "metrics:events_dead_total",
+        "metrics:api_latency_total_ms",
+        "metrics:api_request_count",
+        "metrics:queue_delay_total_ms",
+        "metrics:queue_delay_count",
+        "metrics:queue_delay_max_ms",
     ]
-    
+        
     values = await redis_client.mget(keys)
     
+    api_latency_total = float(values[5]) if values[5] else 0
+    api_request_count = int(values[6]) if values[6] else 0
+
+    queue_delay_total = int(values[7]) if values[7] else 0
+    queue_delay_count = int(values[8]) if values[8] else 0
+    queue_delay_max = int(values[9]) if values[9] else 0
+    
+    avg_api_latency = (
+        api_latency_total / api_request_count
+        if api_request_count
+        else 0
+    )
+
+    avg_queue_delay = (
+        queue_delay_total / queue_delay_count
+        if queue_delay_count
+        else 0
+    )
+
     try:
         pending_info = await redis_client.xpending(
             "webhook_events",
@@ -127,6 +151,9 @@ async def get_metrics():
 
     timestamp = datetime.now(timezone.utc).isoformat()
     return {
+    "avg_api_latency_ms": round(avg_api_latency, 2),
+    "avg_queue_delay_ms": round(avg_queue_delay, 2),
+    "max_queue_delay_ms": queue_delay_max,
     "events_created": int(values[0]) if values[0] else 0,
     "events_delivered": int(values[1]) if values[1] else 0,
     "delivery_attempts": int(values[2]) if values[2] else 0,
@@ -135,3 +162,21 @@ async def get_metrics():
     "pending messages": pending_messages,
     "timestamp": timestamp
 }
+
+@router.post("/metrics/reset")
+async def reset_metrics_dashboard():
+    """Admin route to wipe metrics counters before a new load test."""
+    keys = [
+        "metrics:events_created",
+        "metrics:events_delivered_total", 
+        "metrics:delivery_attempts",
+        "metrics:events_failed_total", 
+        "metrics:events_dead_total",
+        "metrics:api_latency_total_ms",
+        "metrics:api_request_count",
+        "metrics:queue_delay_total_ms",
+        "metrics:queue_delay_count",
+        "metrics:queue_delay_max_ms",
+    ]
+    await redis_client.delete(*keys)
+    return {"message": "All metrics successfully cleared"}
