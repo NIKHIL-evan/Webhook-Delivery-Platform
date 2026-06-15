@@ -6,8 +6,6 @@ from contextlib import asynccontextmanager
 from app.telemetry import request_trace_id 
 from app.routers import endpoints, events, attempts, tenants, generate_key, observability
 from app.redis_client import redis_client
-import asyncio
-from worker import worker_loop, retry_loop
 from app.middleware import metrics_middleware
 
 class TraceMiddleware(BaseHTTPMiddleware):
@@ -42,14 +40,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         if "BUSYGROUP" not in str(e):
             raise
-    
-    asyncio.create_task(worker_loop("worker-1"))
-    asyncio.create_task(worker_loop("worker-2"))
-    asyncio.create_task(worker_loop("worker-3"))
-    asyncio.create_task(worker_loop("worker-4"))
-    asyncio.create_task(worker_loop("worker-5"))
-    asyncio.create_task(worker_loop("worker-6"))
-    asyncio.create_task(retry_loop())
 
     yield
 
