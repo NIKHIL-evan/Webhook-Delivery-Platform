@@ -1,5 +1,5 @@
 import time
-from app.redis_client import redis_client
+from app.core.redis_client import redis_client
 
 async def metrics_middleware(request, call_next):
     start = time.perf_counter()

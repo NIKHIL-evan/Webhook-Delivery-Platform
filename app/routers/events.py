@@ -1,16 +1,15 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.database import get_db
-from app.models import Event, Endpoint, Tenant
-from app.dependencies import get_current_tenant
-from sqlalchemy.exc import SQLAlchemyError
+from app.core.database import get_db
+from app.models import Endpoint, Tenant
+from app.core.dependencies import get_current_tenant
 from pydantic import BaseModel
 import uuid
 from typing import Optional
 from sqlalchemy import select
-from app.redis_client import redis_client
-from app.telemetry import request_trace_id
-import time, asyncio
+from app.core.redis_client import redis_client
+from app.core.telemetry import request_trace_id
+import time, asyncio, json
 from cachetools import TTLCache
 from fastapi.responses import JSONResponse
 
@@ -63,164 +62,79 @@ class EventCreate(BaseModel):
 @router.post("/events")
 async def register_event(
     body: EventCreate,
+    background_tasks: BackgroundTasks,
     tenant: Tenant = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
 ):
-    route_start = time.perf_counter()
+    start_time = time.perf_counter()
     current_trace_id = request_trace_id.get()
 
-    try:
+    # 1. Endpoint Validation (Cached)
+    endpoint = await get_endpoint_cached(body.endpoint_id, tenant.id, db)
 
-        start_endpoint = time.perf_counter()
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
 
-        endpoint = await get_endpoint_cached(
-        body.endpoint_id, tenant.id, db
-        )
+    # 2. Generate Event ID
+    new_event_id = str(uuid.uuid4())
+    event_id_to_return = new_event_id
 
-        endpoint_lookup_ms = (
-            time.perf_counter() - start_endpoint
-        ) * 1000
+    # Idempotency Check
+    is_idempotent_retry = False
 
-        after_endpoint = time.perf_counter()
+    if body.idempotency_key:
+        redis_idem_key = f"idem:{tenant.id}:{body.idempotency_key}"
+        is_new_request = await redis_client.set(redis_idem_key, new_event_id, nx=True, ex=86400)
 
-        if endpoint is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Endpoint not found"
-            )
-
-        if body.idempotency_key:
-            existing = await db.execute(
-                select(Event).where(
-                    Event.idempotency_key == body.idempotency_key,
-                    Event.tenant_id == tenant.id
-                )
-            )
-
-            event = existing.scalar_one_or_none()
-
-            if event:
-                return {
-                    "event_id": str(event.id),
-                    "endpoint_id": str(event.endpoint_id),
-                    "payload": event.payload,
-                    "status": event.status,
-                    "created_at": str(event.created_at)
-                }
-
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        print(type(e).__name__)
-        print(str(e))
-        raise
-
-    try:
-        event = Event(
-            tenant_id=tenant.id,
-            endpoint_id=body.endpoint_id,
-            payload=body.payload,
-            idempotency_key=body.idempotency_key,
-            trace_id=current_trace_id
-        )
-        
-        start_insert = time.perf_counter()
-
-        db.add(event)
-        await db.commit()
-
-        insert_event_ms = (
-            time.perf_counter() - start_insert
-        ) * 1000
-
-        after_insert = time.perf_counter()
-
-    except SQLAlchemyError as e:
-        await db.rollback()
-
-        print("\n" + "=" * 80)
-        print("EVENT CREATION ERROR")
-        print(type(e).__name__)
-        print(str(e))
-        print("=" * 80 + "\n")
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Database error: {type(e).__name__}"
-        )
-
-    try:
-        start_xadd = time.perf_counter()
-
-        await redis_client.xadd(
-            "webhook_events",
-            {
-                "event_id": str(event.id),
+        if not is_new_request:
+            existing_id = await redis_client.get(redis_idem_key)
+            event_id_to_return = existing_id.decode('utf-8') if isinstance(existing_id, bytes) else existing_id
+            is_idempotent_retry = True
+    
+    if is_idempotent_retry:
+        return JSONResponse(
+            content={
+                "event_id": event_id_to_return,
                 "endpoint_id": str(endpoint.id),
-                "trace_id": str(current_trace_id),
-                "queued_at": str(time.time())
-            }
+                "status": "queued",
+                "message": "Idempotent return"
+            },
+            status_code=202
         )
+    
+    # 3. Push Directly to Redis
+    redis_payload = {
+        "event_id": str(new_event_id),
+        "tenant_id": str(tenant.id),
+        "endpoint_id": str(endpoint.id),
+        "destination_url": endpoint.url,
+        "signing_secret": tenant.signing_secret,
+        "payload": json.dumps(body.payload),
+        "idempotency_key": body.idempotency_key or "",
+        "trace_id": str(current_trace_id),
+        "queued_at": str(time.time())
+    }
+    
+    await redis_client.xadd("webhook_events", redis_payload)
 
-        redis_xadd_ms = (
-            time.perf_counter() - start_xadd
-        ) * 1000
-
-        after_xadd = time.perf_counter()
-
-    except Exception as e:
-        print(type(e).__name__)
-        print(str(e))
-        raise
-
-    route_end = time.perf_counter()
-
-    endpoint_stage_ms = (
-        after_endpoint - route_start
-    ) * 1000
-
-    insert_stage_ms = (
-        after_insert - after_endpoint
-    ) * 1000
-
-    xadd_stage_ms = (
-        after_xadd - after_insert
-    ) * 1000
-
-    route_total_ms = (
-        route_end - route_start
-    ) * 1000
-
+    api_latency = (time.perf_counter() - start_time) * 1000
 
     async with redis_client.pipeline(transaction=False) as pipe:
-        pipe.incrbyfloat("metrics:endpoint_lookup_total_ms", endpoint_lookup_ms)
-        pipe.incr("metrics:endpoint_lookup_count")
-        pipe.incrbyfloat("metrics:event_insert_total_ms", insert_event_ms)
-        pipe.incr("metrics:event_insert_count")
-        pipe.incrbyfloat("metrics:redis_xadd_total_ms",redis_xadd_ms)
-        pipe.incr("metrics:redis_xadd_count")
         pipe.incr("metrics:events_created")
-        pipe.incrbyfloat("metrics:endpoint_stage_total_ms", endpoint_stage_ms)
-        pipe.incr("metrics:endpoint_stage_count")
-        pipe.incrbyfloat("metrics:insert_stage_total_ms", insert_stage_ms)
-        pipe.incr("metrics:insert_stage_count")
-        pipe.incrbyfloat("metrics:xadd_stage_total_ms", xadd_stage_ms)
-        pipe.incr("metrics:xadd_stage_count")
-        pipe.incrbyfloat("metrics:route_total_ms", route_total_ms)
-        pipe.incr("metrics:route_total_count")
+        pipe.incrbyfloat("metrics:api_latency_total_ms", api_latency)
+        pipe.incr("metrics:api_request_count")
         await pipe.execute()
 
+    # 5. Immediate Return
     response = JSONResponse(
         content={
-            "event_id": str(event.id),
-            "endpoint_id": str(event.endpoint_id),
-            "payload": event.payload,
-            "status": event.status,
-            "created_at": str(event.created_at)
-        }
-)
-
-    response.headers["X-Route-Time"] = f"{route_total_ms:.2f}"
-
+            "event_id": str(new_event_id),
+            "endpoint_id": str(endpoint.id),
+            "status": "queued"
+        },
+        status_code=202
+    )
+    response.headers["X-Route-Time"] = f"{api_latency:.2f}"
+    
     return response
+

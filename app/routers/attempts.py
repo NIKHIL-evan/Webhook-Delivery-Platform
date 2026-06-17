@@ -2,9 +2,9 @@ import uuid
 from fastapi import APIRouter
 from fastapi import HTTPException
 from fastapi import Depends
-from app.database import get_db
+from app.core.database import get_db
 from app.models import DeliveryAttempt, Event, Tenant
-from app.dependencies import get_current_tenant
+from app.core.dependencies import get_current_tenant
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError 

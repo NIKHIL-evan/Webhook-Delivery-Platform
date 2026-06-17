@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import Depends
 from sqlalchemy import select
 from pydantic import BaseModel
-from app.database import get_db
+from app.core.database import get_db
 from app.models import Tenant, ApiKey
 from datetime import datetime, timezone
 import uuid

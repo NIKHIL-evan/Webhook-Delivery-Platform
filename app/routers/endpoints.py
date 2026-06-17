@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException, Depends
 from app.models import Endpoint, Tenant
-from app.dependencies import get_current_tenant
+from app.core.dependencies import get_current_tenant
 from pydantic import BaseModel
-from app.database import get_db
+from app.core.database import get_db
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import SQLAlchemyError
 

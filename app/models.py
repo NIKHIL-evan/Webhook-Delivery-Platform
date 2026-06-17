@@ -5,7 +5,7 @@ import uuid
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy import DateTime
+from sqlalchemy import DateTime, UniqueConstraint
 from typing import Optional
 from datetime import timezone
 from datetime import datetime
@@ -40,19 +40,22 @@ class Event(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
     endpoint_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("endpoints.id"))
-    idempotency_key: Mapped[Optional[str]] = mapped_column(unique=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String, nullable=True) 
     status: Mapped[str] = mapped_column(default="pending")
     payload: Mapped[dict] = mapped_column(JSONB)
     trace_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
     attempt_count: Mapped[int] = mapped_column(default=0)
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'idempotency_key', name='uq_tenant_idempotency'),
+    )
 
 class DeliveryAttempt(Base):
     __tablename__ = "delivery_attempts"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("events.id"))
+    event_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
     attempt_number: Mapped[int] 
     status: Mapped[str]
     response_code: Mapped[Optional[int]]

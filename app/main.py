@@ -3,10 +3,10 @@ from fastapi import FastAPI, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
 
-from app.telemetry import request_trace_id 
+from app.core.telemetry import request_trace_id 
 from app.routers import endpoints, events, attempts, tenants, generate_key, observability
-from app.redis_client import redis_client
-from app.middleware import metrics_middleware
+from app.core.redis_client import redis_client
+from app.core.middleware import metrics_middleware
 
 class TraceMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
