@@ -1,198 +1,370 @@
-Webhook Delivery Platform
+# Webhook Delivery Platform
 
-A highly concurrent, production-inspired webhook delivery system built with FastAPI, PostgreSQL, Redis Streams, and asynchronous worker processes.
+A highly concurrent, production-grade webhook dispatcher built with FastAPI, PostgreSQL, Redis Streams, and asynchronous worker processes.
 
-The platform guarantees at-least-once delivery, processes payloads asynchronously, retries failures with exponential backoff, and ensures total decoupling of the API ingestion layer from the physical database persistence layer.
+The platform guarantees **at-least-once delivery**, performs asynchronous webhook execution, retries failures using exponential backoff, and completely decouples API ingestion from database persistence.
 
-Architectural Evolution
+---
 
-This platform evolved through distinct phases to overcome the fundamental limits of synchronous database interactions under heavy concurrent load.
+# Architectural Evolution
 
-The Synchronous Bottleneck (Previous Architecture)
+## Phase 1 — Synchronous CRUD Architecture
 
-In its previous iteration, the platform operated as a standard CRUD API:
+The system initially followed a traditional synchronous design.
 
-API received payload.
+### Request Flow
 
-API executed a synchronous INSERT to PostgreSQL.
+1. Receive incoming event.
+2. Insert event into PostgreSQL.
+3. Push event ID to Redis.
+4. Return `202 Accepted`.
 
-API pushed the ID to Redis Streams.
+### Bottleneck
 
-API returned 202 Accepted.
+Under heavy load (500 concurrent clients), API workers rapidly exhausted the PostgreSQL connection pool.
 
-The Failure Point: Under a load of 500 concurrent clients, the API processes instantly saturated the PostgreSQL connection pool (max 20 connections). Requests waited in memory for an available database lock, driving the average API latency from 80ms to over 790ms, with maximum latencies exceeding 4 seconds. Throughput capped at ~500 RPS. The database had become a strict synchronous bottleneck.
+As requests accumulated:
 
-The Asynchronous Breakthrough (Current Architecture)
+* Database connections became the primary bottleneck.
+* Requests waited for available connections.
+* Memory pressure increased.
+* Latency grew dramatically.
 
-To break the connection pool starvation, the platform was refactored to an Asynchronous Ingestion Pattern utilizing "Fat Messages" (Payload Enrichment). The API no longer communicates with PostgreSQL on the critical write path.
+### Observed Results
 
-The New Pipeline:
+| Metric              | Value                      |
+| ------------------- | -------------------------- |
+| Average API Latency | 790ms+                     |
+| Maximum Latency     | 4s+                        |
+| Primary Bottleneck  | PostgreSQL Connection Pool |
 
-Edge Ingestion: The API authenticates the request via TTLCache, handles idempotency via Redis SET NX, enriches the payload with destination data, and pushes directly to a Redis Stream (webhook_events). The database is bypassed entirely.
+---
 
-Delivery Workers: Background processes consume webhook_events, execute the HTTP POST to the destination, and push the HTTP result to a second stream (webhook_results). They execute zero SQL queries.
+## Phase 2 — Distributed Asynchronous Architecture
 
-Sink Workers (Eventual Consistency): Two dedicated background workers consume batches of 500 messages from the Redis streams and execute bulk INSERT statements into PostgreSQL.
+To remove database contention from the critical request path, the platform was redesigned around an asynchronous ingestion model.
 
-By shifting database writes to background sink workers, the API is freed to process network requests at maximum speed.
+The API layer no longer communicates with PostgreSQL while processing incoming requests.
 
-Current Architecture
+### Edge Ingestion Layer
 
+The FastAPI API layer performs:
+
+* API key authentication through in-memory TTLCache
+* Endpoint ownership validation
+* Redis-based idempotency checks (`SET NX`)
+* Payload enrichment ("Fat Messages")
+* Redis Stream publication
+
+After publication to Redis, the request immediately returns.
+
+### Delivery Workers
+
+Eight independent delivery worker processes consume messages from Redis Streams.
+
+Responsibilities:
+
+* Read events from stream
+* Execute outbound HTTP POST requests
+* Generate delivery results
+* Publish results to a second stream
+
+Workers perform:
+
+* No PostgreSQL writes
+* No PostgreSQL reads
+* No foreign-key lookups
+
+This eliminates database contention from delivery execution.
+
+### Sink Workers
+
+Dedicated sink workers batch data into PostgreSQL.
+
+#### Event Sink
+
+Consumes events and performs bulk inserts.
+
+#### Result Sink
+
+Consumes delivery results and performs bulk inserts.
+
+Batch persistence significantly reduces:
+
+* Transaction overhead
+* Lock contention
+* Connection churn
+
+### Eventual Consistency
+
+Redis acts as the system's write buffer.
+
+Persistence occurs asynchronously, allowing:
+
+* High throughput ingestion
+* Reduced latency
+* Controlled database load
+
+---
+
+# System Architecture
+
+```mermaid
 graph TD
-    Client[Client] -->|POST /events| API[FastAPI Edge Layer]
-    API -->|Auth/Endpoint Cache| Memory[TTLCache]
-    API -->|Idempotency SET NX| RedisCache[(Redis Cache)]
-    API -->|XADD Enriched Payload| Stream1[Redis Stream: webhook_events]
-    
-    Stream1 -->|XREADGROUP| DeliveryWorkers[Delivery Workers x8]
-    Stream1 -->|XREADGROUP| EventSink[Event Sink Worker]
-    
-    DeliveryWorkers -->|HTTP POST| Destination[Destination Server]
-    DeliveryWorkers -->|XADD Result| Stream2[Redis Stream: webhook_results]
-    
-    EventSink -->|Batch INSERT 500| Postgres[(PostgreSQL)]
-    
-    Stream2 -->|XREADGROUP| ResultSink[Result Sink Worker]
-    ResultSink -->|Batch INSERT 500| Postgres
-    
-    Retry[Retry Scheduler] -->|Query Failed| Postgres
-    Retry -->|Re-queue| Stream1
 
+    Client[Client]
+        -->|POST /events| API[FastAPI Edge Layer]
 
-Core Features
+    API
+        -->|Auth Cache| Cache[TTLCache]
 
-Asynchronous Ingestion: Zero database locks on the API write path.
+    API
+        -->|SET NX| RedisCache[(Redis)]
 
-Idempotency (Redis NX): Millisecond-level duplicate rejection before the stream.
+    API
+        -->|XADD| EventStream[webhook_events]
 
-Payload Enrichment: Workers require zero DB reads to execute HTTP deliveries.
+    EventStream
+        -->|XREADGROUP| DeliveryWorkers[Delivery Workers x8]
 
-Multi-tenant Isolation: Scoped API keys, endpoint ownership validation.
+    EventStream
+        -->|XREADGROUP| EventSink[Event Sink Worker]
 
-HMAC-SHA256 Signing: Outgoing webhooks are cryptographically signed.
+    DeliveryWorkers
+        -->|HTTP POST| Destination[Destination Server]
 
-Exponential Backoff: Automated retry scheduling for failed deliveries.
+    DeliveryWorkers
+        -->|XADD| ResultStream[webhook_results]
 
-Eventual Consistency: Background batch-inserts to PostgreSQL events and delivery_attempts without foreign key locking overhead.
+    EventSink
+        -->|Batch Insert 500| PostgreSQL[(PostgreSQL)]
 
-Observability & Telemetry
+    ResultStream
+        -->|XREADGROUP| ResultSink[Result Sink Worker]
 
-Because the system is fully decoupled, traditional latency metrics (like API response time) no longer reflect system health. The observability layer tracks the friction between the distributed pipes.
+    ResultSink
+        -->|Batch Insert 500| PostgreSQL
 
-GET /metrics/summary provides pipeline telemetry:
+    Retry[Retry Scheduler]
+        -->|Requeue Failed Events| EventStream
 
-avg_api_edge: Time to authenticate, check idempotency, and push to Redis.
+    Retry
+        -->|Query Failed Deliveries| PostgreSQL
 
-avg_delivery_queue_delay: Time a message waits in Redis before a Delivery Worker claims it.
+    Sweeper[Dead Letter Sweeper]
+        -->|XAUTOCLAIM| EventStream
+```
 
-avg_db_ingestion_lag: Time between an event entering Redis and being persisted to PostgreSQL.
+---
 
-avg_db_batch_insert: Time for the Sink Worker to execute a bulk insert of 500 rows.
+# Core Infrastructure Patterns
 
-pending_delivery_tasks / pending_db_ingestions: Current backlog in Redis consumer groups.
+## Asynchronous Ingestion
 
-Performance Benchmarks
+No database operations occur on the API write path.
 
-The Transition (Phase 4 vs Phase 5)
+Benefits:
 
-Test Configuration:
+* Lower latency
+* Higher throughput
+* No connection pool starvation
 
-4 API Uvicorn Worker Processes
+---
 
-8 Delivery Workers
+## Payload Enrichment (Fat Messages)
 
-1 Event Sink Worker, 1 Result Sink Worker
+Events contain all information required for delivery.
 
-Load: 10,000 Requests, 500 Concurrent Clients
+Benefits:
 
-Metric
+* Zero database lookups during execution
+* Faster workers
+* Reduced operational complexity
 
-Synchronous DB Model
+---
 
-Async Ingestion Model
+## Redis-Based Idempotency
 
-Improvement
+Duplicate requests are rejected using:
 
-Throughput (RPS)
+```text
+SET key value NX EX ttl
+```
 
-519.10
+Benefits:
 
-1179.68
+* Constant-time duplicate detection
+* Prevents duplicate deliveries
+* Protects downstream systems
 
-+127%
+---
 
-Avg API Latency
+## Fault Recovery
 
-790.32 ms
+A dedicated sweeper process uses:
 
-199.99 ms
+```text
+XAUTOCLAIM
+```
 
--74%
+to reclaim messages from crashed workers.
 
-Max API Latency
+Benefits:
 
-4908.00 ms
+* Automatic recovery
+* No orphaned messages
+* Improved reliability
 
-2037.00 ms
+---
 
--58%
+## Multi-Tenant Isolation
 
-Delivery Queue Delay
+Every API key is scoped to its owner.
 
-3042.64 ms
+Validation includes:
 
-17.90 ms
+* API key ownership
+* Endpoint ownership
+* Tenant isolation
 
--99%
+---
 
-DB Ingestion Lag
+## HMAC Signatures
 
-N/A (Blocking)
+Every outbound webhook includes:
 
-9.26 ms
+```text
+X-Signature
+```
 
-Flawless decoupling
+generated using:
 
-Success/Persistence
+```text
+HMAC-SHA256
+```
 
-100%
+Benefits:
 
-100%
+* Payload verification
+* Tamper detection
+* Consumer-side authenticity checks
 
-Zero Data Loss
+---
 
-Engineering Findings:
+## Eventual Consistency
 
-Connection Pool Starvation Eliminated: The API no longer competes for database connections. The 127% increase in throughput is entirely attributed to replacing the SQL driver overhead with a Redis memory push.
+Redis absorbs write bursts while PostgreSQL persists data asynchronously.
 
-Sink Efficiency: A single Event Sink worker batch-inserting 500 rows at a time can easily outpace 4 API processes receiving 1100+ RPS. Ingestion lag remained under 10ms.
+Benefits:
 
-Queue Collapse: By removing the SELECT statements from the Delivery Workers, they are able to claim, execute, and acknowledge messages with an average delay of only 17.9 milliseconds.
+* Stable database load
+* Improved scalability
+* Higher throughput
 
-Running the Platform
+---
 
-To simulate a production deployment locally, the platform utilizes a process orchestrator script to bypass Python's GIL and run the components as isolated microservices.
+# Performance Benchmarks
 
-# Execute the orchestrator
+## Test Configuration
+
+Infrastructure:
+
+* 4 Uvicorn API processes
+* 8 Delivery Worker processes
+* 1 Event Sink Worker
+* 1 Result Sink Worker
+* 1 Retry Runner
+
+Load Test:
+
+* 10,000 Requests
+* 500 Concurrent Clients
+
+---
+
+## Results
+
+| Metric                       | Result       | Evaluation                             |
+| ---------------------------- | ------------ | -------------------------------------- |
+| Throughput                   | 1,047.80 RPS | Sustained throughput exceeded 1K RPS   |
+| Average API Latency          | 166.21 ms    | Stable under heavy load                |
+| Delivery Queue Delay         | 6.62 ms      | Near real-time consumption             |
+| Database Ingestion Lag       | 6.72 ms      | Minimal persistence delay              |
+| Batch Insert Time (500 rows) | 4.96 ms      | PostgreSQL handled inserts efficiently |
+| Success Rate                 | 100%         | No event loss                          |
+| Persistence Rate             | 100%         | Stream backlog fully drained           |
+
+---
+
+# Deployment
+
+To simulate a production-style deployment locally:
+
+```bash
+chmod +x scripts/start_local.sh
 ./scripts/start_local.sh
+```
 
+---
 
-Deployed Microservices:
+# Running Services
 
-uvicorn (x4 processes): API Edge layer.
+```text
+4x  uvicorn processes
+8x  delivery workers
+1x  event sink worker
+1x  result sink worker
+1x  retry runner
+```
 
-app.workers.delivery_worker (x8 processes): Webhook HTTP executors.
+---
 
-app.workers.event_sink_worker (x1 process): PostgreSQL events batch ingestion.
+# Future Improvements
 
-app.workers.result_sink_worker (x1 process): PostgreSQL delivery_attempts batch ingestion.
+## Retry Scheduling
 
-app.workers.retry_runner (x1 process): Failed event requeuing.
+Current implementation:
 
-Known Limitations & Technical Debt
+* Polls PostgreSQL every 5 seconds
 
-Ghost Messages (Dead Letters): If a worker hard-crashes mid-HTTP request, the Redis message remains in the pending state indefinitely. XCLAIM logic is required to sweep and re-assign orphaned messages.
+Potential upgrades:
 
-Polling-Based Retries: The retry scheduler currently polls PostgreSQL every 5 seconds.
+* PostgreSQL LISTEN / NOTIFY
+* Redis delayed queues
+* RabbitMQ delayed exchanges
+* Dedicated scheduling service
 
-OpenTelemetry: Tracing is currently application-level JSON logging, not yet emitting OTLP format to a collector.
+---
+
+## Distributed Tracing
+
+Current implementation:
+
+* Structured JSON logs
+
+Future implementation:
+
+* OpenTelemetry
+* OTLP Exporters
+* Grafana Tempo
+* Jaeger
+
+This will provide end-to-end visibility across:
+
+* API ingestion
+* Redis Streams
+* Delivery workers
+* Sink workers
+* PostgreSQL persistence
+
+---
+
+# Key Outcomes
+
+* Completely removed PostgreSQL from the API write path.
+* Eliminated connection-pool bottlenecks during ingestion.
+* Achieved sustained throughput above 1,000 requests/sec.
+* Reduced queue processing delays to single-digit milliseconds.
+* Maintained 100% event persistence and delivery tracking.
+* Built a fault-tolerant distributed pipeline using FastAPI, Redis Streams, and PostgreSQL.
+* Established a scalable foundation for future observability, tracing, and horizontal scaling initiatives.

@@ -55,7 +55,7 @@ async def sink_loop():
                 await session.execute(stmt)
                 await session.commit()
             
-            batch_insert_ms = (time.perf_counter - db_start_time) * 1000
+            batch_insert_ms = (time.perf_counter() - db_start_time) * 1000
 
             last_message_fields = messages[-1][1]
             queued_at = float(last_message_fields.get("queued_at", time.time()))
