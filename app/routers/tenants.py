@@ -12,12 +12,15 @@ router = APIRouter()
 
 class TenantCreate(BaseModel):
     name: str
+    rate_limit: int | None = None
 
 @router.post("/tenants")
 async def register_tenant(body: TenantCreate, db: AsyncSession = Depends(get_db)):
     try:
         secret = "whsec_" + secrets.token_urlsafe(32)
         tenant = Tenant(name=body.name, signing_secret=secret)
+        if body.rate_limit is not None:
+            tenant.rate_limit = body.rate_limit
         db.add(tenant)
         await db.commit()
         await db.refresh(tenant)
