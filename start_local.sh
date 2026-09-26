@@ -3,12 +3,12 @@
 echo "Starting Webhook Delivery Platform using uv..."
 
 # 1. Start the API with 4 worker processes
-echo "Starting API (4 workers)..."
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4 &
+echo "Starting API (8 workers)..."
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 8 &
 
-# 2. Start the 8 Delivery Workers
-echo "Starting 8 Delivery Workers..."
-for i in {1..8}
+# 2. Start the 6 Delivery Workers
+echo "Starting 6 Delivery Workers..."
+for i in {1..6}
 do
    uv run python -m app.workers.delivery_worker "delivery-$i" &
 done

@@ -12,6 +12,7 @@ from app.core.telemetry import request_trace_id
 import time, asyncio, json
 from cachetools import TTLCache
 from fastapi.responses import JSONResponse
+from app.core.local_metrics import incr, add
 
 _endpoint_cache: TTLCache = TTLCache(maxsize=5000, ttl=300)
 _endpoint_locks: dict[str, asyncio.Lock] = {}
@@ -119,11 +120,9 @@ async def register_event(
 
     api_latency = (time.perf_counter() - start_time) * 1000
 
-    async with redis_client.pipeline(transaction=False) as pipe:
-        pipe.incr("metrics:events_created")
-        pipe.incrbyfloat("metrics:api_latency_total_ms", api_latency)
-        pipe.incr("metrics:api_request_count")
-        await pipe.execute()
+    incr("metrics:events_created")
+    add("metrics:api_latency_total_ms", api_latency)
+    incr("metrics:api_request_count")
 
     # 5. Immediate Return
     response = JSONResponse(

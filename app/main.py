@@ -1,12 +1,11 @@
-import uuid
+import uuid, asyncio
 from fastapi import FastAPI, Request
-from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
-
+from app.core.local_metrics import flush_forever
 from app.core.telemetry import request_trace_id 
 from app.routers import endpoints, events, attempts, tenants, generate_key, observability
 from app.core.redis_client import redis_client
-from app.core.middleware import metrics_middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 class TraceMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -41,11 +40,14 @@ async def lifespan(app: FastAPI):
         if "BUSYGROUP" not in str(e):
             raise
 
+    app.state.metrics_task = asyncio.create_task(flush_forever())
+
     yield
+
+    app.state.metrics_task.cancel()  
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(TraceMiddleware)
-app.middleware("http")(metrics_middleware)
 app.include_router(endpoints.router)
 app.include_router(events.router)
 app.include_router(attempts.router)

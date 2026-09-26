@@ -1,0 +1,227 @@
+diff --git a/app/core/middleware.py b/app/core/middleware.py
+deleted file mode 100644
+index 09c27c7..0000000
+--- a/app/core/middleware.py
++++ /dev/null
+@@ -1,20 +0,0 @@
+-import time
+-from app.core.redis_client import redis_client
+-
+-async def metrics_middleware(request, call_next):
+-    start = time.perf_counter()
+-
+-    response = await call_next(request)
+-
+-    duration_ms = (time.perf_counter() - start) * 1000
+-
+-    await redis_client.incrbyfloat(
+-        "metrics:api_latency_total_ms",
+-        duration_ms
+-    )
+-
+-    await redis_client.incr(
+-        "metrics:api_request_count"
+-    )
+-
+-    return response
+\ No newline at end of file
+diff --git a/app/main.py b/app/main.py
+index 36913dc..60f09ba 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -1,8 +1,7 @@
+ import uuid
+ from fastapi import FastAPI, Request
+-from starlette.middleware.base import BaseHTTPMiddleware
+ from contextlib import asynccontextmanager
+-
++from app.core.local_metrics import flush_forever
+ from app.core.telemetry import request_trace_id 
+ from app.routers import endpoints, events, attempts, tenants, generate_key, observability
+ from app.core.redis_client import redis_client
+@@ -41,11 +40,14 @@ async def lifespan(app: FastAPI):
+         if "BUSYGROUP" not in str(e):
+             raise
+ 
++    app.state.metrics_task = asyncio.create_task(flush_forever())
++
+     yield
+ 
++    app.state.metrics_task.cancel()  
++
+ app = FastAPI(lifespan=lifespan)
+ app.add_middleware(TraceMiddleware)
+-app.middleware("http")(metrics_middleware)
+ app.include_router(endpoints.router)
+ app.include_router(events.router)
+ app.include_router(attempts.router)
+diff --git a/app/routers/events.py b/app/routers/events.py
+index 4b0c425..1c2dc1a 100644
+--- a/app/routers/events.py
++++ b/app/routers/events.py
+@@ -119,11 +119,9 @@ async def register_event(
+ 
+     api_latency = (time.perf_counter() - start_time) * 1000
+ 
+-    async with redis_client.pipeline(transaction=False) as pipe:
+-        pipe.incr("metrics:events_created")
+-        pipe.incrbyfloat("metrics:api_latency_total_ms", api_latency)
+-        pipe.incr("metrics:api_request_count")
+-        await pipe.execute()
++    incr("metrics:events_created")
++    add("metrics:api_latency_total_ms", api_latency)
++    incr("metrics:api_request_count")
+ 
+     # 5. Immediate Return
+     response = JSONResponse(
+diff --git a/app/workers/delivery_worker.py b/app/workers/delivery_worker.py
+index a1a2cd3..70ffd55 100644
+--- a/app/workers/delivery_worker.py
++++ b/app/workers/delivery_worker.py
+@@ -3,6 +3,7 @@ import httpx, asyncio, uuid, sys
+ from datetime import timezone, datetime
+ import json, hmac, hashlib
+ import structlog, time
++from app.core.local_metrics import flush_forever, incr, add, observe_max
+ 
+ http_client = httpx.AsyncClient(timeout=10.0)
+ 
+@@ -14,22 +15,14 @@ structlog.configure(
+ )
+ base_logger = structlog.get_logger()
+ 
+-# Lua script to atomically update the max queue delay
+-LUA_UPDATE_MAX = """
+-local current = redis.call('get', KEYS[1])
+-if not current or tonumber(ARGV[1]) > tonumber(current) then
+-    redis.call('set', KEYS[1], ARGV[1])
+-    return 1
+-end
+-return 0
+-"""
+-
+ async def worker_loop(worker_name: str):
+     print(f"Starting Delivery Worker {worker_name}")
+     try:
+         await redis_client.xgroup_create("webhook_events", "delivery_workers", mkstream=True)
+     except Exception:
+         pass
++    
++    metrics_task = asyncio.create_task(flush_forever())
+ 
+     while True:
+         await redis_client.set(f"worker:{worker_name}:last_seen", datetime.now(timezone.utc).timestamp())
+@@ -85,21 +78,18 @@ async def worker_loop(worker_name: str):
+             }
+             await redis_client.xadd("webhook_results", result_payload)
+             
+-            # Update Metrics Pipeline
+-            async with redis_client.pipeline(transaction=False) as pipe:
+-                pipe.incr("metrics:delivery_attempts")
+-                pipe.incrbyfloat("metrics:queue_delay_total_ms", queue_delay_ms)
+-                pipe.incr("metrics:queue_delay_count")
+-                
+-                if status_str == "success":
+-                    pipe.incr("metrics:events_delivered_total")
+-                else:
+-                    pipe.incr("metrics:events_failed_total")
+-                await pipe.execute()
++                        # Update metrics (in memory; flushed to Redis once per second)
++            incr("metrics:delivery_attempts")
++            add("metrics:queue_delay_total_ms", queue_delay_ms)
++            incr("metrics:queue_delay_count")
+ 
+-            # Execute Max Queue Delay Lua Script
+-            await redis_client.eval(LUA_UPDATE_MAX, 1, "metrics:queue_delay_max_ms", queue_delay_ms)
++            if status_str == "success":
++                incr("metrics:events_delivered_total")
++            else:
++                incr("metrics:events_failed_total")
+ 
++            observe_max("metrics:queue_delay_max_ms", queue_delay_ms)
++            
+             # Acknowledge the original event
+             await redis_client.xack("webhook_events", "delivery_workers", message_id)
+ 
+diff --git a/main.py b/main.py
+deleted file mode 100644
+index b0dfecd..0000000
+--- a/main.py
++++ /dev/null
+@@ -1,6 +0,0 @@
+-def main():
+-    print("Hello from webhook-delivery!")
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/pyproject.toml b/pyproject.toml
+index 59a8bc5..e492ea1 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -8,6 +8,7 @@ dependencies = [
+     "aiohttp>=3.14.3",
+     "alembic>=1.20.0",
+     "asyncpg>=0.31.0",
++    "cachetools>=7.2.0",
+     "fastapi>=0.141.1",
+     "httpx>=0.28.1",
+     "locust>=2.46.5",
+diff --git a/start_local.sh b/start_local.sh
+index 29f6537..4d6dc42 100755
+--- a/start_local.sh
++++ b/start_local.sh
+@@ -3,12 +3,12 @@
+ echo "Starting Webhook Delivery Platform using uv..."
+ 
+ # 1. Start the API with 4 worker processes
+-echo "Starting API (4 workers)..."
+-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4 &
++echo "Starting API (8 workers)..."
++uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 8 &
+ 
+-# 2. Start the 8 Delivery Workers
+-echo "Starting 8 Delivery Workers..."
+-for i in {1..8}
++# 2. Start the 6 Delivery Workers
++echo "Starting 6 Delivery Workers..."
++for i in {1..6}
+ do
+    uv run python -m app.workers.delivery_worker "delivery-$i" &
+ done
+diff --git a/uv.lock b/uv.lock
+index 9b6a924..262c975 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -274,6 +274,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/f5/10/56978295c14794b2c12007b07f3e41ba26acda9257457d7085b0bb3bb90c/brotli-1.2.0-cp314-cp314-win_amd64.whl", hash = "sha256:e7c0af964e0b4e3412a0ebf341ea26ec767fa0b4cf81abb5e897c9338b5ad6a3", size = 375639, upload-time = "2025-11-05T18:38:55.67Z" },
+ ]
+ 
++[[package]]
++name = "cachetools"
++version = "7.2.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/29/2c/3f18755527b03ca9ff6be724bd5370cb777c76a87f17301377cf04a4729b/cachetools-7.2.0.tar.gz", hash = "sha256:bcac1a1b8da6909994a2957238a57b8140dab7c5c5c69a43669654fe87a33c1d", size = 41129, upload-time = "2026-09-16T20:48:27.209Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/cc/bb/1c6e7a89b11da19f137e4ef5a5c5fe47a5bb686449ba343944ccf8fb34b2/cachetools-7.2.0-py3-none-any.whl", hash = "sha256:3045213f186b89fdd95d94441354c4bd87c570b7a38d8c3fd1d9dd37f6dc90d8", size = 16918, upload-time = "2026-09-16T20:48:25.575Z" },
++]
++
+ [[package]]
+ name = "certifi"
+ version = "2026.7.22"
+@@ -1833,6 +1842,7 @@ dependencies = [
+     { name = "aiohttp" },
+     { name = "alembic" },
+     { name = "asyncpg" },
++    { name = "cachetools" },
+     { name = "fastapi" },
+     { name = "httpx" },
+     { name = "locust" },
+@@ -1850,6 +1860,7 @@ requires-dist = [
+     { name = "aiohttp", specifier = ">=3.14.3" },
+     { name = "alembic", specifier = ">=1.20.0" },
+     { name = "asyncpg", specifier = ">=0.31.0" },
++    { name = "cachetools", specifier = ">=7.2.0" },
+     { name = "fastapi", specifier = ">=0.141.1" },
+     { name = "httpx", specifier = ">=0.28.1" },
+     { name = "locust", specifier = ">=2.46.5" },
