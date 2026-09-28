@@ -1,17 +1,23 @@
-import hashlib, time, asyncio, json
+import asyncio
+import hashlib
+import json
 from datetime import datetime, timezone
+
+import structlog
+from cachetools import TTLCache
 from fastapi import HTTPException, Security
 from fastapi.security import APIKeyHeader
 from sqlalchemy import select, update
+
 from app.core.database import AsyncSessionLocal
-from app.models import ApiKey, Tenant
 from app.core.redis_client import redis_client
+from app.models import ApiKey, Tenant
 
 api_key_header = APIKeyHeader(name="API-Key", auto_error=True)
+logger = structlog.get_logger()
 
 # ---------------------------------------------------------
-# ATOMIC RATE LIMITING
-# Evaluates INCR and EXPIRE in a single Redis network trip
+# ATOMIC RATE LIMITING (unchanged)
 # ---------------------------------------------------------
 RATE_LIMIT_LUA = """
 local current = redis.call('INCR', KEYS[1])
@@ -24,34 +30,46 @@ return current
 async def _apply_rate_limit(tenant_id: str, rate_limit: int) -> None:
     redis_key = f"rate_limit:{tenant_id}"
     current_count = await redis_client.eval(RATE_LIMIT_LUA, 1, redis_key, 60)
-    
+
     if current_count > rate_limit:
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 # ---------------------------------------------------------
-# BUFFERED DATABASE WRITES
-# Prevents connection pool starvation under heavy load
+# LAST-USED GATE (per process, in memory)
+# Postgres gets at most one last_used_at write per key per 15 min
+# per process. Duplicates across processes are harmless: the write
+# is idempotent ("last used ≈ now").
 # ---------------------------------------------------------
-async def _update_last_used_buffered(key_hash: str) -> None:
-    """Updates last_used_at a maximum of once per 15 minutes per key."""
-    cache_key = f"last_used_synced:{key_hash}"
-    
-    # If the key was set successfully, it means 15 minutes have passed
-    is_time_to_update = await redis_client.set(cache_key, "1", nx=True, ex=900)
-    
-    if is_time_to_update:
-        try:
-            async with AsyncSessionLocal() as session:
-                await session.execute(
-                    update(ApiKey)
-                    .where(ApiKey.key_hash == key_hash)
-                    .values(last_used_at=datetime.now(timezone.utc))
-                )
-                await session.commit()
-        except Exception:
-            # If the DB fails, delete the lock so it tries again on the next request
-            await redis_client.delete(cache_key)
+_last_used_synced: TTLCache = TTLCache(maxsize=10_000, ttl=900)
+_background_tasks: set[asyncio.Task] = set()
 
+def _maybe_update_last_used(key_hash: str) -> None:
+    # Check and mark with no await in between → only one request wins.
+    if key_hash in _last_used_synced:
+        return
+    _last_used_synced[key_hash] = True
+
+    task = asyncio.create_task(_write_last_used(key_hash))
+    _background_tasks.add(task)                        # hold a strong reference
+    task.add_done_callback(_background_tasks.discard)  # release it when finished
+
+async def _write_last_used(key_hash: str) -> None:
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                update(ApiKey)
+                .where(ApiKey.key_hash == key_hash)
+                .values(last_used_at=datetime.now(timezone.utc))
+            )
+            await session.commit()
+    except Exception as e:
+        # Un-mark so the next request retries instead of waiting 15 min.
+        _last_used_synced.pop(key_hash, None)
+        logger.error("last_used_write_failed", error=str(e))
+
+# ---------------------------------------------------------
+# AUTH DEPENDENCY
+# ---------------------------------------------------------
 async def get_current_tenant(
     api_key: str = Security(api_key_header),
 ) -> Tenant:
@@ -67,9 +85,9 @@ async def get_current_tenant(
         tenant.rate_limit = data["rate_limit"]
         tenant.signing_secret = data["signing_secret"]
         tenant.is_active = data["is_active"]
-        
+
         await _apply_rate_limit(str(tenant.id), tenant.rate_limit)
-        asyncio.create_task(_update_last_used_buffered(key_hash))
+        _maybe_update_last_used(key_hash)          # ← was: asyncio.create_task(...)
         return tenant
 
     # Slow path
@@ -78,7 +96,7 @@ async def get_current_tenant(
         stmt = select(ApiKey, Tenant).join(
             Tenant, ApiKey.tenant_id == Tenant.id
         ).where(
-            Tenant.is_active == True,
+            Tenant.is_active == True,  # noqa: E712 - SQLAlchemy needs ==, not "is"
             ApiKey.key_hash == key_hash,
             ApiKey.revoked_at.is_(None),
             (ApiKey.expires_at.is_(None)) | (ApiKey.expires_at > current_time)
@@ -106,6 +124,5 @@ async def get_current_tenant(
         )
 
     await _apply_rate_limit(str(tenant.id), tenant.rate_limit)
-    asyncio.create_task(_update_last_used_buffered(key_hash))
-    
+    _maybe_update_last_used(key_hash)              # ← was: asyncio.create_task(...)
     return tenant

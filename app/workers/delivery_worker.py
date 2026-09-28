@@ -14,6 +14,7 @@ structlog.configure(
     ]
 )
 base_logger = structlog.get_logger()
+HEARTBEAT_INTERVAL_S = 5 
 
 async def worker_loop(worker_name: str):
     print(f"Starting Delivery Worker {worker_name}")
@@ -21,12 +22,21 @@ async def worker_loop(worker_name: str):
         await redis_client.xgroup_create("webhook_events", "delivery_workers", mkstream=True)
     except Exception:
         pass
-    
-    metrics_task = asyncio.create_task(flush_forever())
+
+    metrics_task = asyncio.create_task(flush_forever())  # noqa: F841 - hold a strong reference so the task isn't garbage-collected
+    last_heartbeat = 0.0  # 0 → the first loop beats immediately
 
     while True:
-        await redis_client.set(f"worker:{worker_name}:last_seen", datetime.now(timezone.utc).timestamp())
         try:
+            # Heartbeat at most every 5 s, inside the try so a Redis blip can't kill the worker.
+            now = time.monotonic()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
+                await redis_client.set(
+                    f"worker:{worker_name}:last_seen",
+                    datetime.now(timezone.utc).timestamp(),  # wall-clock: health check compares with time.time()
+                )
+                last_heartbeat = now
+
             response = await redis_client.xreadgroup(
                 groupname="delivery_workers",
                 consumername=worker_name,
@@ -65,7 +75,7 @@ async def worker_loop(worker_name: str):
                 resp_code = resp.status_code
                 if resp.status_code < 300:
                     status_str = "success"
-            except httpx.RequestError as e:
+            except httpx.RequestError :
                 pass 
 
             # Push Result to Redis
