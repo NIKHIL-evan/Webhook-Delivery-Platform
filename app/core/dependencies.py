@@ -5,19 +5,22 @@ from datetime import datetime, timezone
 
 import structlog
 from cachetools import TTLCache
-from fastapi import HTTPException, Security
+from fastapi import Depends, HTTPException, Security
 from fastapi.security import APIKeyHeader
 from sqlalchemy import select, update
 
 from app.core.database import AsyncSessionLocal
 from app.core.redis_client import redis_client
+from app.core.redis_scripts import RATE_LIMIT_WINDOW_S
 from app.models import ApiKey, Tenant
 
 api_key_header = APIKeyHeader(name="API-Key", auto_error=True)
 logger = structlog.get_logger()
 
 # ---------------------------------------------------------
-# ATOMIC RATE LIMITING (unchanged)
+# RATE LIMITING for routes other than POST /events
+# (POST /events rate-limits inside the ingest script, using
+# the SAME key and logic, so each tenant has one shared budget)
 # ---------------------------------------------------------
 RATE_LIMIT_LUA = """
 local current = redis.call('INCR', KEYS[1])
@@ -29,29 +32,25 @@ return current
 
 async def _apply_rate_limit(tenant_id: str, rate_limit: int) -> None:
     redis_key = f"rate_limit:{tenant_id}"
-    current_count = await redis_client.eval(RATE_LIMIT_LUA, 1, redis_key, 60)
+    current_count = await redis_client.eval(RATE_LIMIT_LUA, 1, redis_key, RATE_LIMIT_WINDOW_S)
 
     if current_count > rate_limit:
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 # ---------------------------------------------------------
-# LAST-USED GATE (per process, in memory)
-# Postgres gets at most one last_used_at write per key per 15 min
-# per process. Duplicates across processes are harmless: the write
-# is idempotent ("last used ≈ now").
+# LAST-USED GATE (per process, in memory) — unchanged from Task 2
 # ---------------------------------------------------------
 _last_used_synced: TTLCache = TTLCache(maxsize=10_000, ttl=900)
 _background_tasks: set[asyncio.Task] = set()
 
 def _maybe_update_last_used(key_hash: str) -> None:
-    # Check and mark with no await in between → only one request wins.
     if key_hash in _last_used_synced:
         return
     _last_used_synced[key_hash] = True
 
     task = asyncio.create_task(_write_last_used(key_hash))
-    _background_tasks.add(task)                        # hold a strong reference
-    task.add_done_callback(_background_tasks.discard)  # release it when finished
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 async def _write_last_used(key_hash: str) -> None:
     try:
@@ -63,16 +62,17 @@ async def _write_last_used(key_hash: str) -> None:
             )
             await session.commit()
     except Exception as e:
-        # Un-mark so the next request retries instead of waiting 15 min.
         _last_used_synced.pop(key_hash, None)
         logger.error("last_used_write_failed", error=str(e))
 
 # ---------------------------------------------------------
-# AUTH DEPENDENCY
+# AUTH DEPENDENCIES
 # ---------------------------------------------------------
-async def get_current_tenant(
+async def authenticate_tenant(
     api_key: str = Security(api_key_header),
 ) -> Tenant:
+    """API key → tenant. No rate limit (used by POST /events,
+    which rate-limits inside the ingest script)."""
     key_hash = hashlib.sha256(api_key.encode()).hexdigest()
     cache_key = f"tenant_cache:{key_hash}"
 
@@ -86,8 +86,7 @@ async def get_current_tenant(
         tenant.signing_secret = data["signing_secret"]
         tenant.is_active = data["is_active"]
 
-        await _apply_rate_limit(str(tenant.id), tenant.rate_limit)
-        _maybe_update_last_used(key_hash)          # ← was: asyncio.create_task(...)
+        _maybe_update_last_used(key_hash)
         return tenant
 
     # Slow path
@@ -123,6 +122,13 @@ async def get_current_tenant(
             })
         )
 
+    _maybe_update_last_used(key_hash)
+    return tenant
+
+
+async def get_current_tenant(
+    tenant: Tenant = Depends(authenticate_tenant),
+) -> Tenant:
+    """API key → tenant, plus the rate limit. Used by every route except POST /events."""
     await _apply_rate_limit(str(tenant.id), tenant.rate_limit)
-    _maybe_update_last_used(key_hash)              # ← was: asyncio.create_task(...)
     return tenant
