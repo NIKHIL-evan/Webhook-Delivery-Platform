@@ -18,9 +18,7 @@ api_key_header = APIKeyHeader(name="API-Key", auto_error=True)
 logger = structlog.get_logger()
 
 # ---------------------------------------------------------
-# RATE LIMITING for routes other than POST /events
-# (POST /events rate-limits inside the ingest script, using
-# the SAME key and logic, so each tenant has one shared budget)
+# RATE LIMITING for routes other than POST /events (unchanged)
 # ---------------------------------------------------------
 RATE_LIMIT_LUA = """
 local current = redis.call('INCR', KEYS[1])
@@ -38,7 +36,7 @@ async def _apply_rate_limit(tenant_id: str, rate_limit: int) -> None:
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 # ---------------------------------------------------------
-# LAST-USED GATE (per process, in memory) — unchanged from Task 2
+# LAST-USED GATE (unchanged from Task 2)
 # ---------------------------------------------------------
 _last_used_synced: TTLCache = TTLCache(maxsize=10_000, ttl=900)
 _background_tasks: set[asyncio.Task] = set()
@@ -66,30 +64,30 @@ async def _write_last_used(key_hash: str) -> None:
         logger.error("last_used_write_failed", error=str(e))
 
 # ---------------------------------------------------------
-# AUTH DEPENDENCIES
+# TENANT CACHE: two levels
+#   L1 = this process's memory, 30 s  → most requests, no Redis trip
+#   L2 = Redis, 300 s                 → shared by all processes; DEL on revoke
+# A revoked key stops working within L1_TTL (≤ 30 s) in every process.
 # ---------------------------------------------------------
-async def authenticate_tenant(
-    api_key: str = Security(api_key_header),
-) -> Tenant:
-    """API key → tenant. No rate limit (used by POST /events,
-    which rate-limits inside the ingest script)."""
-    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-    cache_key = f"tenant_cache:{key_hash}"
+TENANT_L1_TTL_S = 30
+TENANT_L2_TTL_S = 300
 
-    # Fast path
-    cached = await redis_client.get(cache_key)
-    if cached:
-        data = json.loads(cached)
-        tenant = Tenant()
-        tenant.id = data["id"]
-        tenant.rate_limit = data["rate_limit"]
-        tenant.signing_secret = data["signing_secret"]
-        tenant.is_active = data["is_active"]
+_tenant_l1: TTLCache = TTLCache(maxsize=10_000, ttl=TENANT_L1_TTL_S)
 
-        _maybe_update_last_used(key_hash)
-        return tenant
+def _l2_key(key_hash: str) -> str:
+    return f"tenant_cache:{key_hash}"
 
-    # Slow path
+def _tenant_from_data(data: dict) -> Tenant:
+    tenant = Tenant()
+    tenant.id = data["id"]
+    tenant.rate_limit = data["rate_limit"]
+    tenant.signing_secret = data["signing_secret"]
+    tenant.is_active = data["is_active"]
+    return tenant
+
+async def _load_tenant_data_from_db(key_hash: str) -> dict:
+    """Postgres: the source of truth. Raises 401 for unknown, revoked,
+    expired keys or inactive tenants."""
     async with AsyncSessionLocal() as session:
         current_time = datetime.now(timezone.utc)
         stmt = select(ApiKey, Tenant).join(
@@ -103,27 +101,55 @@ async def authenticate_tenant(
         result = await session.execute(stmt)
         row = result.unique().one_or_none()
 
-        if row is None:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid API key or inactive tenant"
-            )
+    if row is None:
+        raise HTTPException(status_code=401, detail="Invalid API key or inactive tenant")
 
-        api_key_record, tenant = row
+    _, tenant = row
+    return {
+        "id": str(tenant.id),
+        "rate_limit": tenant.rate_limit,
+        "signing_secret": tenant.signing_secret,
+        "is_active": tenant.is_active,
+    }
 
-        await redis_client.setex(
-            cache_key,
-            300,
-            json.dumps({
-                "id": str(tenant.id),
-                "rate_limit": tenant.rate_limit,
-                "signing_secret": tenant.signing_secret,
-                "is_active": tenant.is_active
-            })
-        )
+async def _get_tenant_data(key_hash: str) -> dict:
+    # L1: this process's memory (no trip)
+    data = _tenant_l1.get(key_hash)
+    if data is not None:
+        return data
 
+    # L2: Redis (shared)
+    cached = await redis_client.get(_l2_key(key_hash))
+    if cached:
+        data = json.loads(cached)
+    else:
+        # Postgres (truth), then fill L2
+        data = await _load_tenant_data_from_db(key_hash)
+        await redis_client.setex(_l2_key(key_hash), TENANT_L2_TTL_S, json.dumps(data))
+
+    _tenant_l1[key_hash] = data
+    return data
+
+async def invalidate_api_key(key_hash: str) -> None:
+    """Call AFTER the revocation is committed in Postgres."""
+    _tenant_l1.pop(key_hash, None)                       # this process: immediately
+    try:
+        await redis_client.delete(_l2_key(key_hash))     # shared L2: no process can refill from it
+    except Exception as e:
+        # The revocation is already committed; L2 still expires within TENANT_L2_TTL_S.
+        logger.error("tenant_cache_invalidation_failed", error=str(e))
+
+# ---------------------------------------------------------
+# AUTH DEPENDENCIES
+# ---------------------------------------------------------
+async def authenticate_tenant(
+    api_key: str = Security(api_key_header),
+) -> Tenant:
+    """API key → tenant. No rate limit (POST /events rate-limits in its script)."""
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+    data = await _get_tenant_data(key_hash)
     _maybe_update_last_used(key_hash)
-    return tenant
+    return _tenant_from_data(data)
 
 
 async def get_current_tenant(

@@ -78,7 +78,8 @@ async def worker_loop(worker_name: str):
             except httpx.RequestError :
                 pass 
 
-            # Push Result to Redis
+                        # Record the result AND finish the event in ONE trip, as one transaction:
+            # both run, or (if the worker dies first) neither runs and the event is redelivered.
             result_payload = {
                 "event_id": event_id,
                 "attempt_number": str(attempt_count),
@@ -86,9 +87,12 @@ async def worker_loop(worker_name: str):
                 "response_code": str(resp_code) if resp_code else "0",
                 "attempted_at": str(time.time())
             }
-            await redis_client.xadd("webhook_results", result_payload)
-            
-                        # Update metrics (in memory; flushed to Redis once per second)
+            async with redis_client.pipeline(transaction=True) as pipe:
+                pipe.xadd("webhook_results", result_payload)
+                pipe.xack("webhook_events", "delivery_workers", message_id)
+                await pipe.execute()
+
+            # Metrics only after the result is safely recorded (in memory; flushed once per second)
             incr("metrics:delivery_attempts")
             add("metrics:queue_delay_total_ms", queue_delay_ms)
             incr("metrics:queue_delay_count")
@@ -99,9 +103,6 @@ async def worker_loop(worker_name: str):
                 incr("metrics:events_failed_total")
 
             observe_max("metrics:queue_delay_max_ms", queue_delay_ms)
-            
-            # Acknowledge the original event
-            await redis_client.xack("webhook_events", "delivery_workers", message_id)
 
         except Exception as e:
             base_logger.error("worker_loop_crashed", error=str(e))

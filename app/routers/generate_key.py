@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from app.core.database import get_db
 from app.models import Tenant, ApiKey
 from datetime import datetime, timezone
+from app.core.dependencies import invalidate_api_key
 import uuid
 import secrets
 import hashlib
@@ -84,6 +85,9 @@ async def revoke_api_key(api_key_id: uuid.UUID,db: AsyncSession = Depends(get_db
     db.add(api_key)
     await db.commit()
     await db.refresh(api_key)
+
+    # Truth is committed → now remove cached copies
+    await invalidate_api_key(api_key.key_hash)
 
     return {
         "message": "API key revoked",
