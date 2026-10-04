@@ -94,11 +94,56 @@ async def redis_sweeper_loop():
         except Exception as e:
             base_logger.error("redis_sweeper_loop_crashed", error=str(e))
 
+# ---------------------------------------------------------
+# STREAM TRIMMER: delete only entries EVERY consumer group has finished.
+# Never trims unread or un-ACKed entries, so it can't lose events.
+# ---------------------------------------------------------
+STREAM_GROUPS = {
+    "webhook_events": ["delivery_workers", "ingestion_workers"],
+    "webhook_results": ["results_ingestion_workers"],
+}
+TRIM_INTERVAL_S = 10
+
+def _id_key(stream_id: str) -> tuple[int, int]:
+    # "1790600000000-12" → (1790600000000, 12), so IDs compare as numbers
+    ms, seq = stream_id.split("-")
+    return int(ms), int(seq)
+
+async def _safe_trim_point(stream: str, expected_groups: list[str]) -> str | None:
+    groups = {g["name"]: g for g in await redis_client.xinfo_groups(stream)}
+    candidates = []
+    for name in expected_groups:
+        group = groups.get(name)
+        if group is None:
+            return None                      # a group is missing → trim nothing
+        if group["pending"] > 0:
+            summary = await redis_client.xpending(stream, name)
+            candidates.append(summary["min"])          # oldest un-ACKed entry
+        else:
+            candidates.append(group["last-delivered-id"])
+    return min(candidates, key=_id_key)
+
+async def stream_trimmer_loop():
+    print("Starting Stream Trimmer")
+    while True:
+        await asyncio.sleep(TRIM_INTERVAL_S)
+        for stream, groups in STREAM_GROUPS.items():
+            try:
+                min_id = await _safe_trim_point(stream, groups)
+                if not min_id or min_id == "0-0":
+                    continue
+                removed = await redis_client.xtrim(stream, minid=min_id, approximate=True)
+                if removed:
+                    base_logger.info("stream_trimmed", stream=stream, removed=removed, min_id=min_id)
+            except Exception as e:
+                base_logger.error("stream_trimmer_failed", stream=stream, error=str(e))
+                
 async def main():
     # Run both loops concurrently
     await asyncio.gather(
         postgres_retry_loop(),
-        redis_sweeper_loop()
+        redis_sweeper_loop(),
+        stream_trimmer_loop()
     )
 
 if __name__ == "__main__":
