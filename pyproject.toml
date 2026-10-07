@@ -10,6 +10,7 @@ dependencies = [
     "asyncpg>=0.31.0",
     "cachetools>=7.2.0",
     "fastapi>=0.141.1",
+    "httptools>=0.8.0",
     "httpx>=0.28.1",
     "locust>=2.46.5",
     "psycopg2-binary>=2.9.13",
@@ -19,4 +20,5 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.54",
     "structlog>=26.1.0",
     "uvicorn>=0.53.0",
+    "uvloop>=0.23.0",
 ]
