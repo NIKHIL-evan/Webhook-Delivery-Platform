@@ -4,7 +4,7 @@ echo "Starting Webhook Delivery Platform using uv..."
 
 # 1. Start the API with 4 worker processes
 echo "Starting API (8 workers)..."
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 8 &
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 8 --no-access-log --http httptools --loop uvloop &
 
 # 2. Start the 6 Delivery Workers
 echo "Starting 6 Delivery Workers..."
