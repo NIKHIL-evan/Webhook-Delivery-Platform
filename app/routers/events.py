@@ -11,13 +11,20 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.core.database import AsyncSessionLocal
-from app.core.dependencies import _apply_rate_limit, authenticate_tenant
+from app.core.dependencies import _apply_rate_limit, authenticate_tenant, rate_limited_error
 from app.core.local_metrics import add, incr
 from app.core.redis_scripts import ingest_event
 from app.core.telemetry import request_trace_id
 from app.models import Endpoint, Tenant
 
-
+# ---------------------------------------------------------
+# ENDPOINT CACHE (Round 2 / Task 4)
+#   _endpoint_cache : endpoints that exist         (5 min)
+#   _missing_cache  : endpoint IDs that don't exist (60 s)  ← negative caching
+#   _inflight       : one DB lookup per key at a time       ← single-flight
+# Separate caches so a flood of bad IDs can't evict real endpoints.
+# A DB session is opened ONLY on a miss, never on the hot path.
+# ---------------------------------------------------------
 ENDPOINT_TTL_S = 300
 MISSING_TTL_S = 60
 
@@ -128,7 +135,7 @@ async def register_event(
     )
 
     if status == "limited":
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        raise rate_limited_error(event_id)   # for 'limited', the value is wait_ms
 
     if status == "duplicate":
         return JSONResponse(

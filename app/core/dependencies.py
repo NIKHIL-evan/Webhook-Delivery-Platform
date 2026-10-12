@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import math
 from datetime import datetime, timezone
 
 import structlog
@@ -11,29 +12,29 @@ from sqlalchemy import select, update
 
 from app.core.database import AsyncSessionLocal
 from app.core.redis_client import redis_client
-from app.core.redis_scripts import RATE_LIMIT_WINDOW_S
+from app.core.redis_scripts import check_rate_limit
 from app.models import ApiKey, Tenant
 
 api_key_header = APIKeyHeader(name="API-Key", auto_error=True)
 logger = structlog.get_logger()
 
 # ---------------------------------------------------------
-# RATE LIMITING for routes other than POST /events (unchanged)
+# RATE LIMITING for routes other than POST /events, and for endpoint-cache misses.
+# Same token bucket and same key as the ingest script (redis_scripts.py).
 # ---------------------------------------------------------
-RATE_LIMIT_LUA = """
-local current = redis.call('INCR', KEYS[1])
-if tonumber(current) == 1 then
-    redis.call('EXPIRE', KEYS[1], ARGV[1])
-end
-return current
-"""
+def rate_limited_error(wait_ms: int) -> HTTPException:
+    """429 with Retry-After in whole seconds (rounded up, at least 1)."""
+    retry_after = max(1, math.ceil(wait_ms / 1000))
+    return HTTPException(
+        status_code=429,
+        detail="Rate limit exceeded",
+        headers={"Retry-After": str(retry_after)},
+    )
 
 async def _apply_rate_limit(tenant_id: str, rate_limit: int) -> None:
-    redis_key = f"rate_limit:{tenant_id}"
-    current_count = await redis_client.eval(RATE_LIMIT_LUA, 1, redis_key, RATE_LIMIT_WINDOW_S)
-
-    if current_count > rate_limit:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    allowed, wait_ms = await check_rate_limit(tenant_id, rate_limit)
+    if not allowed:
+        raise rate_limited_error(wait_ms)
 
 # ---------------------------------------------------------
 # LAST-USED GATE (unchanged from Task 2)
