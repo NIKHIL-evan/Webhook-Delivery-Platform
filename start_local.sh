@@ -1,4 +1,5 @@
 #!/bin/bash
+trap 'kill $(jobs -p)' EXIT
 
 echo "Starting Webhook Delivery Platform using uv..."
 

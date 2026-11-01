@@ -133,8 +133,6 @@ async def stream_trimmer_loop():
                 if not min_id or min_id == "0-0":
                     continue
                 removed = await redis_client.xtrim(stream, minid=min_id, approximate=True)
-                if removed:
-                    base_logger.info("stream_trimmed", stream=stream, removed=removed, min_id=min_id)
             except Exception as e:
                 base_logger.error("stream_trimmer_failed", stream=stream, error=str(e))
                 
