@@ -7,7 +7,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from pydantic import BaseModel
 from fastapi import Depends
 import secrets
-
+import traceback
 router = APIRouter()
 
 class TenantCreate(BaseModel):
@@ -31,6 +31,7 @@ async def register_tenant(body: TenantCreate, db: AsyncSession = Depends(get_db)
         }
     except SQLAlchemyError:
         await db.rollback()
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail="Database error"
