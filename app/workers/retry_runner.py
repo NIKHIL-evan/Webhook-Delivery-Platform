@@ -14,6 +14,35 @@ structlog.configure(
 )
 base_logger = structlog.get_logger()
 
+LUA_MOVER_SCRIPT = """
+local now = redis.call('TIME')
+local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+local due_items = redis.call('ZRANGEBYSCORE', 'deferred', '-inf', now_ms, 'LIMIT', 0, 500)
+if #due_items == 0 then return 0 end
+for i, member in ipairs(due_items) do
+    local fields = cjson.decode(member)
+    local xadd_args = {'webhook_retry', '*'}
+    for k, v in pairs(fields) do
+        table.insert(xadd_args, k)
+        table.insert(xadd_args, tostring(v))
+    end
+    redis.call('XADD', unpack(xadd_args))
+    redis.call('ZREM', 'deferred', member)
+end
+return #due_items
+"""
+
+async def mover_loop():
+    print("Starting Redis Deferred Mover Loop")
+    while True:
+        try:
+            await redis_client.eval(LUA_MOVER_SCRIPT, 0)
+        except Exception as e:
+            base_logger.error("mover_loop_crashed", error=str(e))
+
+        await asyncio.sleep(0.1)  # Sleep before checking again
+
+
 async def postgres_retry_loop():
     print("Starting PostgreSQL Retry Scheduler")
     while True:
@@ -141,7 +170,8 @@ async def main():
     await asyncio.gather(
         postgres_retry_loop(),
         redis_sweeper_loop(),
-        stream_trimmer_loop()
+        stream_trimmer_loop(),
+        mover_loop()
     )
 
 if __name__ == "__main__":

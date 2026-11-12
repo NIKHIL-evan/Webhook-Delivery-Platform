@@ -4,9 +4,12 @@ import orjson
 import hashlib
 import hmac
 import sys
+import random
 import time
 import uuid
 from datetime import UTC, datetime
+import collections
+import functools
 
 import aiohttp
 import structlog
@@ -26,6 +29,7 @@ HEARTBEAT_INTERVAL_S = 5
 CONCURRENCY_POOL_SIZE = 1000
 REDIS_BATCH_SIZE = 1000
 RESULTS_BATCH_SIZE = 500
+ENDPOINT_CAP = 50
 
 def prepare_payload_and_signature(payload: dict, secret_key: str) -> tuple[bytes, str]:
     """CPU-bound cryptographic and serialization work."""
@@ -49,10 +53,12 @@ async def results_batcher_loop(results_queue: asyncio.Queue):
         
         try:
             async with redis_client.pipeline(transaction=True) as pipe:
-                message_ids = []
+                acks_by_stream = collections.defaultdict(list)
+                
                 for data in batch:
+                    stream_name = data["stream_name"]
                     message_id = data["message_id"]
-                    message_ids.append(message_id)
+                    acks_by_stream[stream_name].append(message_id)
                     
                     result_payload = {
                         "event_id": data["event_id"],
@@ -63,8 +69,10 @@ async def results_batcher_loop(results_queue: asyncio.Queue):
                     }
                     pipe.xadd("webhook_results", result_payload)
                 
-                if message_ids:
-                    pipe.xack("webhook_events", "delivery_workers", *message_ids)
+                # Execute the XACKs dynamically based on where they came from
+                for stream, msg_ids in acks_by_stream.items():
+                    if msg_ids:
+                        pipe.xack(stream, "delivery_workers", *msg_ids)
                     
                 await pipe.execute()
             
@@ -95,6 +103,11 @@ async def worker_loop(worker_name: str):
     except Exception as e:
         if "BUSYGROUP" not in str(e):
             raise
+    try:
+        await redis_client.xgroup_create("webhook_retry", "delivery_workers", mkstream=True)
+    except Exception as e:
+        if "BUSYGROUP" not in str(e):
+            raise
 
     metrics_task = asyncio.create_task(flush_forever()) 
 
@@ -107,9 +120,13 @@ async def worker_loop(worker_name: str):
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as http_client:
         inflight = set() # keeps track of active tasks
+        endpoint_counts = collections.defaultdict(int)
 
-        def task_done_callback(task: asyncio.Task):
+        def task_done_callback(endpoint_id: str,task: asyncio.Task):
             inflight.discard(task)
+            endpoint_counts[endpoint_id] -= 1
+            if endpoint_counts[endpoint_id] == 0:
+                del endpoint_counts[endpoint_id]
 
         last_heartbeat = 0.0  
 
@@ -136,7 +153,7 @@ async def worker_loop(worker_name: str):
                 response = await redis_client.xreadgroup(
                     groupname="delivery_workers",
                     consumername=worker_name,
-                    streams={"webhook_events": current_read_id},
+                    streams={"webhook_events": current_read_id, "webhook_retry": current_read_id},
                     count=count_to_fetch,
                     block=2000
                 )
@@ -147,13 +164,29 @@ async def worker_loop(worker_name: str):
                         current_read_id = ">"
                     continue
 
-                messages = response[0][1]
-                for message_id, fields in messages:
-                    task =  asyncio.create_task(
-                        process_message(message_id, fields, http_client, results_queue)
-                    )
-                    inflight.add(task)
-                    task.add_done_callback(task_done_callback)
+                for stream_name, messages in response:
+                    for message_id, fields in messages:
+                        
+                        endpoint_id = fields["endpoint_id"]
+
+                        # THE BOUNCER LOGIC
+                        if endpoint_counts.get(endpoint_id, 0) >= ENDPOINT_CAP:
+                            # Park the message in the deferred queue
+                            delay_ms = 5000 + random.randint(0, 1000)
+                            score_ms = int(time.time() * 1000) + delay_ms
+                            
+                            async with redis_client.pipeline(transaction=True) as pipe:
+                                pipe.zadd("deferred", {orjson.dumps(fields): score_ms})
+                                pipe.xack(stream_name, "delivery_workers", message_id) # Acknowledge from the correct stream
+                                await pipe.execute()
+                            
+                        else:
+                            endpoint_counts[endpoint_id] += 1
+                            task =  asyncio.create_task(
+                                process_message(message_id, fields, stream_name, http_client, results_queue)
+                            )
+                            inflight.add(task)
+                            task.add_done_callback(functools.partial(task_done_callback, endpoint_id))
 
         except asyncio.CancelledError:
             base_logger.info("shutdown_signal_received")
@@ -164,7 +197,7 @@ async def worker_loop(worker_name: str):
             metrics_task.cancel()
 
 
-async def process_message(message_id: str, fields: dict, http_client: aiohttp.ClientSession, results_queue: asyncio.Queue):
+async def process_message(message_id: str, fields: dict, stream_name: str, http_client: aiohttp.ClientSession, results_queue: asyncio.Queue):
     try:    
         event_id = fields["event_id"]
         destination_url = fields["destination_url"]
@@ -198,6 +231,7 @@ async def process_message(message_id: str, fields: dict, http_client: aiohttp.Cl
 
         await results_queue.put({
             "message_id": message_id,
+            "stream_name": stream_name,
             "event_id": event_id,
             "attempt_count": attempt_count,
             "status_str": status_str,
