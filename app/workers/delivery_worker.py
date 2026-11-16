@@ -29,7 +29,7 @@ HEARTBEAT_INTERVAL_S = 5
 CONCURRENCY_POOL_SIZE = 1000
 REDIS_BATCH_SIZE = 1000
 RESULTS_BATCH_SIZE = 500
-ENDPOINT_CAP = 50
+GLOBAL_ENDPOINT_CAP = 100
 
 def prepare_payload_and_signature(payload: dict, secret_key: str) -> tuple[bytes, str]:
     """CPU-bound cryptographic and serialization work."""
@@ -129,18 +129,36 @@ async def worker_loop(worker_name: str):
                 del endpoint_counts[endpoint_id]
 
         last_heartbeat = 0.0  
-
+        active_worker_count = 1
         current_read_id = "0"
+        local_endpoint_cap = GLOBAL_ENDPOINT_CAP
 
         try:
             while True:
                 now = time.monotonic()
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
-                    await redis_client.set(
-                        f"worker:{worker_name}:last_seen",
-                        datetime.now(UTC).timestamp(),
-                    )
+                    current_ts = datetime.now(UTC).timestamp()
+                    
+                    async with redis_client.pipeline(transaction=True) as pipe:
+                        # 1. Register this worker
+                        pipe.zadd("cluster:active_workers", {worker_name: current_ts})
+                        # 2. Prune dead workers (no check-in for 15s)
+                        pipe.zremrangebyscore("cluster:active_workers", "-inf", current_ts - 15)
+                        # 3. Count surviving workers
+                        pipe.zcard("cluster:active_workers")
+                        results = await pipe.execute()
+
+                    active_worker_count = max(1, results[2])
+                    local_endpoint_cap = max(1, GLOBAL_ENDPOINT_CAP // active_worker_count)
                     last_heartbeat = now
+
+                    base_logger.info(
+                        "cluster_sync", 
+                        worker=worker_name,
+                        active_cluster_size=active_worker_count, 
+                        global_cap=GLOBAL_ENDPOINT_CAP,
+                        new_local_cap=local_endpoint_cap
+                    )
                 
                 free_slots = CONCURRENCY_POOL_SIZE - len(inflight)
 
@@ -170,7 +188,7 @@ async def worker_loop(worker_name: str):
                         endpoint_id = fields["endpoint_id"]
 
                         # THE BOUNCER LOGIC
-                        if endpoint_counts.get(endpoint_id, 0) >= ENDPOINT_CAP:
+                        if endpoint_counts.get(endpoint_id, 0) >= local_endpoint_cap:
                             # Park the message in the deferred queue
                             delay_ms = 5000 + random.randint(0, 1000)
                             score_ms = int(time.time() * 1000) + delay_ms
