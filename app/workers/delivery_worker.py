@@ -30,6 +30,8 @@ CONCURRENCY_POOL_SIZE = 1000
 REDIS_BATCH_SIZE = 1000
 RESULTS_BATCH_SIZE = 500
 GLOBAL_ENDPOINT_CAP = 100
+MAX_ATTEMPTS = 5
+BASE_BACKOFF_MS = 5000
 
 def prepare_payload_and_signature(payload: dict, secret_key: str) -> tuple[bytes, str]:
     """CPU-bound cryptographic and serialization work."""
@@ -68,8 +70,18 @@ async def results_batcher_loop(results_queue: asyncio.Queue):
                         "attempted_at": str(data["attempted_at"])
                     }
                     pipe.xadd("webhook_results", result_payload)
+                    
+                    # --- ROUTING FAILED EVENTS ---
+                    if data["status_str"] == "failed":
+                        if data["needs_retry"]:
+                            # Park it in deferred for the Lua Mover to wake up later
+                            score_ms = int(time.time() * 1000) + data["retry_delay_ms"]
+                            pipe.zadd("deferred", {orjson.dumps(data["fields"]): score_ms})
+                        else:
+                            # MAX_ATTEMPTS reached. Send to Dead-Letter Queue.
+                            data["fields"]["final_failure_reason"] = f"exhausted_{MAX_ATTEMPTS}_attempts"
+                            pipe.xadd("webhook_dlq", data["fields"])
                 
-                # Execute the XACKs dynamically based on where they came from
                 for stream, msg_ids in acks_by_stream.items():
                     if msg_ids:
                         pipe.xack(stream, "delivery_workers", *msg_ids)
@@ -222,9 +234,8 @@ async def process_message(message_id: str, fields: dict, stream_name: str, http_
         secret_key = fields["signing_secret"]
         payload = orjson.loads(fields["payload"])
         queued_at = float(fields.get("queued_at", time.time()))
-        
+        attempt_count = int(fields.get("attempt_count", "1"))
         queue_delay_ms = (time.time() - queued_at) * 1000
-        attempt_count = 1 
 
         # Offload synchronous CPU work to a background thread to prevent event loop freezing
         payload_bytes, signature_hex = await asyncio.to_thread(
@@ -247,6 +258,18 @@ async def process_message(message_id: str, fields: dict, stream_name: str, http_
         except (aiohttp.ClientError, asyncio.TimeoutError):
             pass 
 
+        needs_retry = False
+        retry_delay_ms = 0
+        
+        if status_str == "failed" and attempt_count < MAX_ATTEMPTS:
+            needs_retry = True
+            # Exponential backoff: 5s, 10s, 20s, 40s + jitter
+            jitter = random.randint(0, 1000)
+            retry_delay_ms = int(BASE_BACKOFF_MS * (2 ** (attempt_count - 1))) + jitter
+            
+            # Increment the attempt count in the payload so the Mover preserves it
+            fields["attempt_count"] = str(attempt_count + 1)
+
         await results_queue.put({
             "message_id": message_id,
             "stream_name": stream_name,
@@ -255,7 +278,10 @@ async def process_message(message_id: str, fields: dict, stream_name: str, http_
             "status_str": status_str,
             "resp_code": resp_code,
             "attempted_at": time.time(),
-            "queue_delay_ms": queue_delay_ms
+            "queue_delay_ms": queue_delay_ms,
+            "fields": fields, # Pass the raw Redis payload down
+            "needs_retry": needs_retry,
+            "retry_delay_ms": retry_delay_ms
         })
 
     except Exception as exc:  # noqa: BLE001

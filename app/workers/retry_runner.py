@@ -43,57 +43,6 @@ async def mover_loop():
         await asyncio.sleep(0.1)  # Sleep before checking again
 
 
-async def postgres_retry_loop():
-    print("Starting PostgreSQL Retry Scheduler")
-    while True:
-        await redis_client.set("retry_scheduler:last_seen", time.time())
-        await asyncio.sleep(5)
-        try:
-            async with AsyncSessionLocal() as session:
-                stm = (
-                    select(Event, Endpoint, Tenant)
-                    .join(Endpoint, Event.endpoint_id == Endpoint.id)
-                    .join(Tenant, Event.tenant_id == Tenant.id)
-                    .where(
-                        Event.status == "failed",
-                        Event.next_retry_at <= datetime.now(timezone.utc),
-                        Event.attempt_count < 5
-                    )
-                )
-                result = await session.execute(stm)
-                rows = result.all()
-
-                for event, endpoint, tenant in rows:
-                    log = base_logger.bind(
-                        trace_id=str(event.trace_id),
-                        event_id=str(event.id),
-                        component="retry_scheduler"
-                    )
-                    log.info("re_enqueuing_postgres_event")
-                    event.status = "queued"
-                    session.add(event)
-                    
-                    await redis_client.xadd(
-                        "webhook_events",
-                        {
-                            "event_id": str(event.id),
-                            "tenant_id": str(event.tenant_id),
-                            "endpoint_id": str(event.endpoint_id),
-                            "destination_url": str(endpoint.url), 
-                            "signing_secret": str(tenant.signing_secret),
-                            "payload": json.dumps(event.payload),
-                            "trace_id": str(event.trace_id) or "unknown",
-                            "queued_at": str(time.time())
-                        }
-                    )
-                    
-                if rows:
-                    await session.commit()
-
-        except Exception as e:
-            base_logger.error("postgres_retry_loop_crashed", error=str(e))
-            await asyncio.sleep(1)
-
 async def redis_sweeper_loop():
     print("Starting Redis Dead-Letter Sweeper")
     while True:
@@ -168,7 +117,6 @@ async def stream_trimmer_loop():
 async def main():
     # Run both loops concurrently
     await asyncio.gather(
-        postgres_retry_loop(),
         redis_sweeper_loop(),
         stream_trimmer_loop(),
         mover_loop()
