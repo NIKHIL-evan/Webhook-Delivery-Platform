@@ -1,18 +1,18 @@
-import uvloop
 import asyncio
-import orjson
+import collections
+import functools
 import hashlib
 import hmac
-import sys
 import random
+import sys
 import time
 import uuid
 from datetime import UTC, datetime
-import collections
-import functools
 
 import aiohttp
+import orjson
 import structlog
+import uvloop
 
 from app.core.local_metrics import add, flush_forever, incr, observe_max
 from app.core.redis_client import redis_client
@@ -29,9 +29,11 @@ HEARTBEAT_INTERVAL_S = 5
 CONCURRENCY_POOL_SIZE = 1000
 REDIS_BATCH_SIZE = 1000
 RESULTS_BATCH_SIZE = 500
-GLOBAL_ENDPOINT_CAP = 100
+GLOBAL_ENDPOINT_CAP = 1000
 MAX_ATTEMPTS = 5
 BASE_BACKOFF_MS = 5000
+CIRCUIT_BREAKER_PENALTY_S = 30 
+local_circuit_breakers = {}
 
 def prepare_payload_and_signature(payload: dict, secret_key: str) -> tuple[bytes, str]:
     """CPU-bound cryptographic and serialization work."""
@@ -230,6 +232,7 @@ async def worker_loop(worker_name: str):
 async def process_message(message_id: str, fields: dict, stream_name: str, http_client: aiohttp.ClientSession, results_queue: asyncio.Queue):
     try:    
         event_id = fields["event_id"]
+        endpoint_id = fields["endpoint_id"]
         destination_url = fields["destination_url"]
         secret_key = fields["signing_secret"]
         payload = orjson.loads(fields["payload"])
@@ -249,14 +252,29 @@ async def process_message(message_id: str, fields: dict, stream_name: str, http_
 
         status_str = "failed"
         resp_code = None
+        current_time = time.time()
 
-        try:
-            async with http_client.post(destination_url, data=payload_bytes, headers=custom_headers) as resp:
-                resp_code = resp.status
-                if resp.status < 300:
-                    status_str = "success"
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            pass 
+        breaker_expiry = local_circuit_breakers.get(endpoint_id, 0)
+
+        if current_time < breaker_expiry:
+            # Circuit breaker is active; skip the request
+            status_str = "failed"
+            resp_code = 503  # Service Unavailable
+            base_logger.debug("circuit_breaker_tripped", endpoint_id=endpoint_id)
+
+        else:
+            try:
+                async with http_client.post(destination_url, data=payload_bytes, headers=custom_headers) as resp:
+                    resp_code = resp.status
+                    if resp.status < 300:
+                        status_str = "success"
+                    elif resp.status >= 500:
+                        local_circuit_breakers[endpoint_id] = current_time + CIRCUIT_BREAKER_PENALTY_S
+
+            except (TimeoutError, aiohttp.ClientError) as e:
+                status_str = "failed"
+                local_circuit_breakers[endpoint_id] = current_time + CIRCUIT_BREAKER_PENALTY_S
+                base_logger.warning("endpoint_offline_breaker_opened", endpoint_id=endpoint_id, error=str(e))
 
         needs_retry = False
         retry_delay_ms = 0
