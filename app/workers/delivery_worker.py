@@ -33,7 +33,7 @@ GLOBAL_ENDPOINT_CAP = 1000
 MAX_ATTEMPTS = 5
 BASE_BACKOFF_MS = 5000
 CIRCUIT_BREAKER_PENALTY_S = 30 
-local_circuit_breakers = {}
+local_circuit_breakers: dict[str, float] = {}
 
 def prepare_payload_and_signature(payload: dict, secret_key: str) -> tuple[bytes, str]:
     """CPU-bound cryptographic and serialization work."""
@@ -41,7 +41,7 @@ def prepare_payload_and_signature(payload: dict, secret_key: str) -> tuple[bytes
     signature_hex = hmac.new(secret_key.encode('utf-8'), payload_bytes, hashlib.sha256).hexdigest()
     return payload_bytes, signature_hex
 
-async def results_batcher_loop(results_queue: asyncio.Queue):
+async def results_batcher_loop(results_queue: asyncio.Queue[dict]):
     """Consumes delivery results and batches them into a single Redis pipeline trip."""
     base_logger.info("starting_results_batcher")
     while True:
@@ -125,7 +125,7 @@ async def worker_loop(worker_name: str):
 
     metrics_task = asyncio.create_task(flush_forever()) 
 
-    results_queue = asyncio.Queue()
+    results_queue: asyncio.Queue[dict] = asyncio.Queue()
     batcher_task = asyncio.create_task(results_batcher_loop(results_queue))
 
     # AIOHTTP optimized for massive persistent concurrency
@@ -133,8 +133,8 @@ async def worker_loop(worker_name: str):
     timeout = aiohttp.ClientTimeout(total=10.0, connect=2.0)
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as http_client:
-        inflight = set() # keeps track of active tasks
-        endpoint_counts = collections.defaultdict(int)
+        inflight: set[asyncio.Task] = set() # keeps track of active tasks
+        endpoint_counts: collections.defaultdict[str, int] = collections.defaultdict(int)
 
         def task_done_callback(endpoint_id: str,task: asyncio.Task):
             inflight.discard(task)
@@ -188,7 +188,7 @@ async def worker_loop(worker_name: str):
                     streams={"webhook_events": current_read_id, "webhook_retry": current_read_id},
                     count=count_to_fetch,
                     block=2000
-                )
+                ) # type: ignore
                 # THE RECOVERY FLIP: If ID "0" returns empty, we've cleared our ghosts. Switch to ">"
                 if not response or not response[0][1]:
                     if current_read_id == "0":
@@ -253,6 +253,7 @@ async def process_message(message_id: str, fields: dict, stream_name: str, http_
         status_str = "failed"
         resp_code = None
         current_time = time.time()
+        server_requested_delay_ms = 0
 
         breaker_expiry = local_circuit_breakers.get(endpoint_id, 0)
 
@@ -268,23 +269,47 @@ async def process_message(message_id: str, fields: dict, stream_name: str, http_
                     resp_code = resp.status
                     if resp.status < 300:
                         status_str = "success"
+
+                    elif 400 <= resp.status < 500 and resp.status != 429:
+                        # FAST-FAIL: 400, 401, 403, 404, etc.
+                        status_str = "failed"
+                        attempt_count = MAX_ATTEMPTS  # Forces it straight to the DLQ
+                        base_logger.info("fatal_4xx_fast_fail", endpoint_id=endpoint_id, status=resp.status)
+                    
+                    elif resp.status == 429:
+                        # RATE LIMIT: Check for Retry-After header
+                        status_str = "failed"
+                        retry_after = resp.headers.get("Retry-After")
+                        if retry_after:
+                            try:
+                                # Convert seconds to ms. (If they send an HTTP Date string instead, 
+                                # this fails safely to the except block and defaults to exponential math).
+                                server_requested_delay_ms = int(retry_after) * 1000
+                            except ValueError:
+                                pass
+                                
                     elif resp.status >= 500:
+                        # SERVER ERROR: Trip the breaker
                         local_circuit_breakers[endpoint_id] = current_time + CIRCUIT_BREAKER_PENALTY_S
 
             except (TimeoutError, aiohttp.ClientError) as e:
                 status_str = "failed"
                 local_circuit_breakers[endpoint_id] = current_time + CIRCUIT_BREAKER_PENALTY_S
                 base_logger.warning("endpoint_offline_breaker_opened", endpoint_id=endpoint_id, error=str(e))
-
+        
+        # --- EXPONENTIAL BACKOFF LOGIC ---
         needs_retry = False
         retry_delay_ms = 0
         
         if status_str == "failed" and attempt_count < MAX_ATTEMPTS:
             needs_retry = True
-            # Exponential backoff: 5s, 10s, 20s, 40s + jitter
-            jitter = random.randint(0, 1000)
-            retry_delay_ms = int(BASE_BACKOFF_MS * (2 ** (attempt_count - 1))) + jitter
-            
+            if server_requested_delay_ms > 0:
+                retry_delay_ms = server_requested_delay_ms
+            else:
+                # Default Exponential backoff: 5s, 10s, 20s, 40s + jitter
+                jitter = random.randint(0, 1000)
+                retry_delay_ms = int(BASE_BACKOFF_MS * (2 ** (attempt_count - 1))) + jitter
+                
             # Increment the attempt count in the payload so the Mover preserves it
             fields["attempt_count"] = str(attempt_count + 1)
 
